@@ -139,7 +139,7 @@ def mock_plugin(**schedule_overrides):
 
 @step("01. 插件包导入（cache 模块未缺失）")
 def test_pkg_import():
-    assert plugin_mod.__version__ == "4.4.3", f"version={plugin_mod.__version__}"
+    assert plugin_mod.__version__ == "4.4.5", f"version={plugin_mod.__version__}"
     cache_mod = imp("cache.lru_cache")
     c = cache_mod.LRUCache(max_size=2)
     c["a"] = 1; c["b"] = 2; c["c"] = 3
@@ -220,7 +220,7 @@ def test_current_toml():
     assert isinstance(inst.config.schedule.inject_into_replyer, bool)
     # inject_mode 在 v4.2 起 deprecated 但保留向后兼容
     assert inst.config.inject.inject_mode in ("smart", "rule")
-    assert inst.config.plugin.config_version == "4.4.3"
+    assert inst.config.plugin.config_version == "4.4.4"
 
 
 @step("06. stream_filter 白名单匹配")
@@ -448,16 +448,30 @@ def test_recent_schedule_summary():
 def test_auto_scheduler():
     sched_mod = imp("planner.auto_scheduler")
     inst = fresh_plugin()
+    s = sched_mod.ScheduleAutoScheduler(inst)
+    s._inferred_prompt_cache = {
+        "target_date": "2026-06-18",
+        "prompt": "明天在卡帕多奇亚醒来，第二天去乘坐热气球，次日晚上看星空，翌日收尾。",
+    }
+
+    effective = s._get_effective_custom_prompt("2026-06-18", "固定日程")
+    assert "明天" not in effective and "第二天" not in effective
+    assert "次日" not in effective and "翌日" not in effective
+    assert "今天在卡帕多奇亚醒来" in effective
+    assert "当天去乘坐热气球" in effective
+    assert "当天晚上看星空" in effective
+    assert "当天收尾" in effective
+    assert s._get_effective_custom_prompt("2026-06-19", "固定日程") == "固定日程"
 
     async def run():
-        s = sched_mod.ScheduleAutoScheduler(inst)
-        assert s.tz_manager.timezone_str == inst.config.schedule.timezone
+        scheduler = sched_mod.ScheduleAutoScheduler(inst)
+        assert scheduler.tz_manager.timezone_str == inst.config.schedule.timezone
         # 强制启用以走完 start 分支（验证 plugin.config.schedule.xxx 全部可访问）
         inst.config.schedule.auto_schedule_enabled = True
-        await s.start()
-        assert s.is_running is True
-        await s.stop()
-        assert s.is_running is False
+        await scheduler.start()
+        assert scheduler.is_running is True
+        await scheduler.stop()
+        assert scheduler.is_running is False
 
     asyncio.run(run())
 
