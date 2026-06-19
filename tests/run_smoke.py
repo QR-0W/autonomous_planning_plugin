@@ -220,7 +220,7 @@ def test_current_toml():
     assert isinstance(inst.config.schedule.inject_into_replyer, bool)
     # inject_mode 在 v4.2 起 deprecated 但保留向后兼容
     assert inst.config.inject.inject_mode in ("smart", "rule")
-    assert inst.config.plugin.config_version == "4.4.4"
+    assert inst.config.plugin.config_version == "4.4.5"
 
 
 @step("06. stream_filter 白名单匹配")
@@ -285,6 +285,7 @@ def test_prompt_builder():
     pb = pb_mod.PromptBuilder({}, tz_mod.TimezoneManager("Asia/Shanghai"))
     prompt = pb.build_schedule_prompt(
         "daily", {},
+        yesterday_context="昨天的日程:\n【06-18 周四】\n  06:40 乘坐热气球 — 在卡帕多奇亚看清晨奇岩地貌\n  20:00 欣赏星空",
         pending_commitments=[{"time": "14:00", "title": "打游戏", "notes": "周末"}],
         history_context="[12:30] 朵昕@群: 今天天气好",
         knowledge_context="麦麦喜欢油豆腐",
@@ -292,6 +293,9 @@ def test_prompt_builder():
     assert "今天需要纳入的约定" in prompt and "打游戏" in prompt
     assert "最近聊天背景" in prompt and "朵昕" in prompt
     assert "相关记忆参考" in prompt and "油豆腐" in prompt
+    assert "连续性要求" in prompt and "不要无理由回到默认学习、游戏、上班日常" in prompt
+    assert "先从最近一天摘要提取当前地点" in prompt
+    assert "禁止照抄示例活动名" in prompt
     assert "跨天活动支持" in prompt
 
 
@@ -412,14 +416,14 @@ def test_recent_schedule_summary():
 
     # 造 3 天历史：昨/前/大前
     for offset, acts in enumerate([
-        [("审稿", 8 * 60), ("写专栏", 14 * 60)],
+        [("写专栏", 14 * 60), ("审稿", 8 * 60)],
         [("回邮件", 8 * 60), ("整理藏书", 14 * 60)],
         [("审稿", 8 * 60), ("写专栏", 14 * 60)],
     ], start=1):
         day = now - _td(days=offset)
         for name, start_min in acts:
             g = gm.create_goal(
-                name=name, description=f"{name}的描述", goal_type="study",
+                name=name, description=f"{name}的描述，延续昨天的主线状态", goal_type="study",
                 creator_id="system", chat_id="global", priority="medium",
                 parameters={"time_window": [start_min, start_min + 120]},
             )
@@ -430,7 +434,9 @@ def test_recent_schedule_summary():
     # days=1 只看昨天
     s1 = loader.load_recent_schedule_summary(days=1)
     assert "审稿" in s1 and "写专栏" in s1
+    assert "延续昨天的主线状态" in s1
     assert "回邮件" not in s1, "days=1 不应看到前天"
+    assert s1.index("08:00 审稿") < s1.index("14:00 写专栏"), "昨日日程应按时间正序输出"
 
     # days=3 看 3 天
     s3 = loader.load_recent_schedule_summary(days=3)
