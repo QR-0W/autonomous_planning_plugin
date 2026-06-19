@@ -172,6 +172,8 @@ def test_components():
 @step("03. UI Section 渲染（4 个顶层 section + 字段 UI 元数据完整）")
 def test_ui_schema():
     inst = fresh_plugin()
+    assert inst.config.plugin.config_version == "4.4.5"
+    assert inst.config.schedule.auto_infer_next_day_prompt is True
     schema = inst.build_config_schema(plugin_id="x.y", plugin_name="t")
     sections = schema["sections"]
     assert set(sections.keys()) == {"plugin", "autonomous_planning", "schedule", "inject"}, \
