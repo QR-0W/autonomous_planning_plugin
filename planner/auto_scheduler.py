@@ -18,11 +18,43 @@ import asyncio
 import datetime
 import json
 import logging
+import re
 
 from ..utils.timezone_manager import TimezoneManager
 from .generator import BaseScheduleGenerator
 
 logger = logging.getLogger(__name__)
+
+
+def _has_future_time_words(text: str) -> bool:
+    """Return True if text contains words implying a future perspective.
+
+    Used to validate that inferred next-day strategies describe the
+    target day from that day's own perspective, not from "tomorrow".
+    """
+    for kw in ("明天", "次日", "翌日", "第二天"):
+        if kw in text:
+            return True
+    for m in re.finditer(r"明日", text):
+        start = m.start()
+        end = m.end()
+        before_ok = start == 0 or text[start - 1] in "，,。；;、\n "
+        after_ok = (
+            end >= len(text)
+            or text[end] in "，,。；;、\n "
+            or any(
+                text[end:].startswith(prefix)
+                for prefix in (
+                    "早上", "上午", "中午", "下午", "晚上", "早晨", "傍晚",
+                    "深夜", "去", "要", "需", "应", "会", "将", "计划",
+                    "打算", "安排", "出发", "起程", "启程", "动身", "起床",
+                    "出门", "离开", "前往",
+                )
+            )
+        )
+        if before_ok and after_ok:
+            return True
+    return False
 
 
 class ScheduleAutoScheduler:
@@ -256,19 +288,30 @@ class ScheduleAutoScheduler:
 
         instruction = (
             "你是日程策略设计助手。"
-            "请基于最近几天的日程与完成状态，为明天生成一段中文'策略提示词'，用于指导明日日程生成。"
+            "请基于最近几天的日程与完成状态，为目标日期生成一段中文'策略提示词'，"
+            "用于指导该目标日期的日程生成。"
             "输出必须是单段纯文本，不要Markdown、不要列表、不要解释。"
+            "这段策略会在目标日期当天作为当日提示使用，所以必须从目标日期当天视角描述，"
+            "使用'今天'或'当天'，禁止使用'明天'、'明日'、'次日'、'翌日'、'第二天'等相对未来词。"
             f"长度控制在120到{max_chars}字之间，强调连续性与现实可执行性。"
             "如果基础要求存在，必须兼容且优先满足。"
         )
 
-        prompt = (
-            f"{instruction}\n\n"
-            f"目标日期：{target_date} {target_weekday}\n"
-            f"基础固定要求（可为空）：{base_prompt if base_prompt else '无'}\n\n"
-            f"最近日程历史：\n{history_summary}\n\n"
-            "请直接输出策略提示词正文："
-        )
+        if base_prompt:
+            prompt = (
+                f"{instruction}\n\n"
+                f"目标日期：{target_date} {target_weekday}\n"
+                f"【长期生活阶段】这是角色正在经历的持续人生阶段，策略必须自然延续这个状态，不要让它突然结束：\n{base_prompt}\n\n"
+                f"最近日程历史（长期状态在近期的具体表现）：\n{history_summary}\n\n"
+                "请直接输出策略提示词正文："
+            )
+        else:
+            prompt = (
+                f"{instruction}\n\n"
+                f"目标日期：{target_date} {target_weekday}\n\n"
+                f"最近日程历史：\n{history_summary}\n\n"
+                "请直接输出策略提示词正文："
+            )
 
         try:
             model_helper = BaseScheduleGenerator(goal_manager, schedule_config)
@@ -298,6 +341,13 @@ class ScheduleAutoScheduler:
             if len(inferred_prompt) > max_chars:
                 inferred_prompt = inferred_prompt[:max_chars].rstrip()
 
+            if _has_future_time_words(inferred_prompt):
+                self.logger.warning(
+                    "次日推断结果包含未来时间词（明天/明日等），"
+                    "目标日使用时会被误解为未来安排，已放弃该推断"
+                )
+                return False
+
             if len(inferred_prompt) < 20:
                 self.logger.warning("次日推断结果过短，已放弃使用")
                 return False
@@ -314,12 +364,23 @@ class ScheduleAutoScheduler:
             self.logger.warning(f"次日策略推断异常，已回退固定prompt: {e}", exc_info=True)
             return False
 
-    def _get_effective_custom_prompt(self, today: str, fallback_prompt: str) -> str:
+    def _get_effective_custom_prompt(self, today: str, configured_prompt: str) -> str:
         inferred_date = str(self._inferred_prompt_cache.get("target_date", "") or "")
         inferred_prompt = str(self._inferred_prompt_cache.get("prompt", "") or "").strip()
         if inferred_date == today and inferred_prompt:
+            if _has_future_time_words(inferred_prompt):
+                self.logger.warning(
+                    "已缓存的次日策略包含未来时间词（明天/明日等），"
+                    "目标日使用时会被误解为未来安排，已放弃使用"
+                )
+                return configured_prompt
+            if configured_prompt:
+                return (
+                    f"【长期生活阶段】\n{configured_prompt}\n\n"
+                    f"【今日策略】\n{inferred_prompt}"
+                )
             return inferred_prompt
-        return fallback_prompt
+        return configured_prompt
 
     async def _schedule_loop(self):
         """
