@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 # 常量定义
 MAX_YESTERDAY_ACTIVITIES = 10  # 昨日日程显示的最大活动数
+MAX_YESTERDAY_DESC_CHARS = 48  # 昨日日程描述最大字符数，保留地点/主线但控制 prompt 长度
 MAX_HISTORY_LINE_CHARS = 80    # 历史消息单行最大字符数
 
 
@@ -68,7 +69,7 @@ class ScheduleContextLoader:
         return self.load_recent_schedule_summary(days=1)
 
     def load_recent_schedule_summary(self, days: int = 3) -> Optional[str]:
-        """加载最近 N 天的日程摘要，用于让 LLM 在生成新日程时避免重复。
+        """加载最近 N 天的日程摘要，用于让 LLM 连续演化新日程。
 
         覆盖范围：``yesterday - (days - 1)`` 到 ``yesterday``。
         过期日程（status=COMPLETED）依然能拉到 —— ``cleanup_expired_schedules``
@@ -99,11 +100,20 @@ class ScheduleContextLoader:
                 for goal in goals:
                     time_window = self._extract_time_window(goal)
                     if time_window:
-                        start_minutes = time_window[0] if isinstance(time_window, list) else 0
+                        try:
+                            start_minutes = int(time_window[0])
+                        except (TypeError, ValueError, IndexError):
+                            continue
                         hour = start_minutes // 60
                         minute = start_minutes % 60
                         time_str = f"{hour:02d}:{minute:02d}"
-                        day_activities.append(f"  {time_str} {goal.name}")
+                        line = f"  {time_str} {goal.name}"
+                        desc = " ".join(str(getattr(goal, "description", "") or "").split())
+                        if desc and desc != str(goal.name):
+                            if len(desc) > MAX_YESTERDAY_DESC_CHARS:
+                                desc = desc[:MAX_YESTERDAY_DESC_CHARS].rstrip() + "…"
+                            line += f" — {desc}"
+                        day_activities.append(line)
 
                 if day_activities:
                     all_lines.append(f"【{day_label} {day_weekday}】")

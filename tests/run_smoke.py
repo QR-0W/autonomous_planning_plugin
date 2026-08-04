@@ -52,7 +52,7 @@ import tempfile
 import tomllib
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
@@ -139,7 +139,7 @@ def mock_plugin(**schedule_overrides):
 
 @step("01. 插件包导入（cache 模块未缺失）")
 def test_pkg_import():
-    assert plugin_mod.__version__ == "4.4.3", f"version={plugin_mod.__version__}"
+    assert plugin_mod.__version__ == "4.4.5", f"version={plugin_mod.__version__}"
     cache_mod = imp("cache.lru_cache")
     c = cache_mod.LRUCache(max_size=2)
     c["a"] = 1; c["b"] = 2; c["c"] = 3
@@ -211,7 +211,14 @@ def test_migration():
 
 @step("05. 当前 config.toml 可加载")
 def test_current_toml():
-    with open(PLUGIN_DIR / "config.toml", "rb") as f:
+    toml_path = PLUGIN_DIR / "config.toml"
+    if not toml_path.exists():
+        inst = fresh_plugin()
+        assert isinstance(inst.config.schedule.admin_users, list)
+        assert isinstance(inst.config.schedule.inject_into_replyer, bool)
+        assert inst.config.plugin.config_version == "4.4.4"
+        return
+    with open(toml_path, "rb") as f:
         cfg = tomllib.load(f)
     inst = plugin_mod.AutonomousPlanningPluginV4()
     inst.set_plugin_config(cfg)
@@ -283,6 +290,8 @@ def test_prompt_builder():
     pb_mod = imp("planner.generator.prompt_builder")
     tz_mod = imp("utils.timezone_manager")
     pb = pb_mod.PromptBuilder({}, tz_mod.TimezoneManager("Asia/Shanghai"))
+
+    # 完整字段注入
     prompt = pb.build_schedule_prompt(
         "daily", {},
         pending_commitments=[{"time": "14:00", "title": "打游戏", "notes": "周末"}],
@@ -411,15 +420,17 @@ def test_recent_schedule_summary():
     now = tz.get_now()
 
     # 造 3 天历史：昨/前/大前
+    # 昨天含一条超长描述，验证截断为 48 字符 + …
+    long_desc = "在甲城的古镇里沿石板路慢慢走，路过一家老茶馆坐下歇脚，顺便拍了些照片。" * 2
     for offset, acts in enumerate([
-        [("审稿", 8 * 60), ("写专栏", 14 * 60)],
-        [("回邮件", 8 * 60), ("整理藏书", 14 * 60)],
-        [("审稿", 8 * 60), ("写专栏", 14 * 60)],
+        [("审稿", 8 * 60, "上午审稿"), ("写专栏", 14 * 60, "下午继续写专栏，把上午的草稿整理成完整篇章")],
+        [("回邮件", 8 * 60, "上午回邮件"), ("整理藏书", 14 * 60, "下午整理藏书")],
+        [("审稿", 8 * 60, long_desc), ("写专栏", 14 * 60, "下午写专栏")],
     ], start=1):
         day = now - _td(days=offset)
-        for name, start_min in acts:
+        for name, start_min, desc in acts:
             g = gm.create_goal(
-                name=name, description=f"{name}的描述", goal_type="study",
+                name=name, description=desc, goal_type="study",
                 creator_id="system", chat_id="global", priority="medium",
                 parameters={"time_window": [start_min, start_min + 120]},
             )
@@ -431,12 +442,22 @@ def test_recent_schedule_summary():
     s1 = loader.load_recent_schedule_summary(days=1)
     assert "审稿" in s1 and "写专栏" in s1
     assert "回邮件" not in s1, "days=1 不应看到前天"
+    # 描述被保留
+    assert "上午审稿" in s1
 
     # days=3 看 3 天
     s3 = loader.load_recent_schedule_summary(days=3)
     assert "审稿" in s3 and "回邮件" in s3 and "整理藏书" in s3
     # 应该出现 3 个【MM-DD】日期块
     assert s3.count("【") == 3, f"应该有 3 个日期块，实际 {s3.count('【')}"
+    # 描述被保留
+    assert "上午审稿" in s3
+    # 超长描述被截断为 48 字符 + …：定位包含该描述的行程行，验证行内描述长度
+    trunc_lines = [l for l in s3.splitlines() if "审稿" in l and "古镇" in l]
+    assert trunc_lines, "应存在含超长描述的审稿行程行"
+    desc_part = trunc_lines[0].split(" — ", 1)[1]
+    assert desc_part.endswith("…"), f"超长描述应以…结尾: {desc_part!r}"
+    assert len(desc_part) <= 49, f"截断后描述应 ≤ 48+1 字符，实际 {len(desc_part)}"
 
     # 向后兼容：load_yesterday_schedule_summary 等价于 days=1
     s_yest = loader.load_yesterday_schedule_summary()
@@ -462,7 +483,178 @@ def test_auto_scheduler():
     asyncio.run(run())
 
 
-@step("16. energy_model 时段能量基线")
+@step("16. 次日策略未来时间词检测")
+def test_future_time_word_detection():
+    as_mod = imp("planner.auto_scheduler")
+    fn = as_mod._has_future_time_words
+
+    for text in (
+        "明天去甲城",
+        "计划明天去甲城",
+        "第二天去甲城",
+        "次日去甲城",
+        "翌日去甲城",
+        "明日早上出发",
+        "明天可以去甲城看看",
+    ):
+        assert fn(text) is True, f"应判定为未来时间词: {text!r}"
+
+    for text in (
+        "明日香参加活动",
+        "今天在甲城探索",
+        "当天去乙城",
+        "",
+    ):
+        assert fn(text) is False, f"不应判定为未来时间词: {text!r}"
+
+    # "明日" 单独存在且位于句首或分句开头应检测到
+    assert fn("明日去甲城") is True
+
+    # 验证 _get_effective_custom_prompt 在缓存包含未来时间词时回退
+    sched_mod = imp("planner.auto_scheduler")
+    inst = fresh_plugin()
+    inst.config.schedule.timezone = "Asia/Shanghai"
+    s = sched_mod.ScheduleAutoScheduler(inst)
+    s._inferred_prompt_cache = {
+        "target_date": "2026-06-18",
+        "prompt": "明天在卡帕多奇亚醒来去乘坐热气球",
+    }
+    effective = s._get_effective_custom_prompt("2026-06-18", "固定日程")
+    assert "明天" not in effective
+    assert effective == "固定日程", (
+        "缓存含未来时间词时应回退为 configured_prompt"
+    )
+
+    s._inferred_prompt_cache = {
+        "target_date": "2026-06-18",
+        "prompt": "今天在卡帕多奇亚探索地下城",
+    }
+    effective = s._get_effective_custom_prompt("2026-06-18", "环游世界")
+    assert "【长期生活阶段】" in effective
+    assert "环游世界" in effective
+    assert "【今日策略】" in effective
+    assert "今天在卡帕多奇亚探索地下城" in effective
+    assert effective.index("【长期生活阶段】") < effective.index("【今日策略】"), (
+        "长期生活阶段应位于今日策略之前"
+    )
+
+    assert s._get_effective_custom_prompt("2026-06-19", "固定日程") == "固定日程"
+
+
+@step("17. 主链路：近期日程上下文进入生成 Prompt")
+def test_daily_generation_uses_recent_context():
+    """临时 DB + Fake LLM：验证普通每日生成主链路会把近期摘要传入最终 Prompt。"""
+    from datetime import timedelta as _td
+
+    gm_mod = imp("planner.goal_manager")
+    sg_mod = imp("planner.schedule_generator")
+
+    frozen_now = datetime(2026, 6, 19, 8, 0)
+
+    class FrozenTimezoneManager:
+        def __init__(self, timezone_str: str = "Asia/Shanghai"):
+            self.timezone_str = timezone_str
+
+        def get_now(self):
+            return frozen_now
+
+    class FakeLLM:
+        def __init__(self):
+            self.prompts: list[str] = []
+
+        async def generate(self, *, prompt, model, max_tokens, temperature):
+            del model, max_tokens, temperature
+            self.prompts.append(prompt)
+            required = [
+                "06:40 乘坐热气球",
+                "甲城",
+            ]
+            missing = [text for text in required if text not in prompt]
+            if missing:
+                return {"success": False, "response": f"missing prompt evidence: {missing!r}"}
+            response = {
+                "schedule_items": [
+                    {"name": "睡觉", "description": "在甲城旅舍睡到清晨", "goal_type": "daily_routine", "priority": "high", "time_slot": "00:00", "duration_hours": 7},
+                    {"name": "起床洗漱", "description": "洗漱后准备继续逛甲城老城", "goal_type": "daily_routine", "priority": "medium", "time_slot": "07:00", "duration_hours": 0.5},
+                    {"name": "早餐", "description": "吃当地早餐，翻昨天照片", "goal_type": "meal", "priority": "high", "time_slot": "07:30", "duration_hours": 0.5},
+                    {"name": "老城漫步", "description": "在甲城老城继续探索街巷", "goal_type": "custom", "priority": "medium", "time_slot": "08:00", "duration_hours": 2.5},
+                    {"name": "午餐", "description": "吃当地风味午餐", "goal_type": "meal", "priority": "high", "time_slot": "12:00", "duration_hours": 1},
+                    {"name": "午休", "description": "回住处短暂休息", "goal_type": "daily_routine", "priority": "medium", "time_slot": "13:00", "duration_hours": 1},
+                    {"name": "河边散步", "description": "傍晚沿河散步看日落", "goal_type": "exercise", "priority": "medium", "time_slot": "17:00", "duration_hours": 1},
+                    {"name": "晚餐", "description": "晚餐吃当地菜", "goal_type": "meal", "priority": "high", "time_slot": "18:00", "duration_hours": 1},
+                    {"name": "夜聊", "description": "和朋友聊今天见闻", "goal_type": "social_maintenance", "priority": "medium", "time_slot": "20:00", "duration_hours": 1},
+                    {"name": "睡前准备", "description": "洗漱后早点休息", "goal_type": "daily_routine", "priority": "medium", "time_slot": "22:00", "duration_hours": 2},
+                ]
+            }
+            return {"success": True, "response": json.dumps(response, ensure_ascii=False)}
+
+    def create_yesterday_history(gm):
+        yesterday = frozen_now - _td(days=1)
+        for name, desc, start, end in [
+            ("乘坐热气球", "在甲城坐上热气球看晨光里的群山，全程很稳", 400, 510),
+            ("老城闲逛", "在甲城古镇沿石板路慢慢走，拍了不少照片", 570, 690),
+        ]:
+            goal = gm.create_goal(
+                name=name, description=desc, goal_type="custom",
+                creator_id="system", chat_id="global", priority="medium",
+                parameters={"time_window": [start, end]},
+            )
+            gm.db.update_goal(goal.goal_id, created_at=yesterday)
+
+    async def run():
+        gm = gm_mod.GoalManager(data_dir=str(Path(tempfile.mkdtemp())))
+        create_yesterday_history(gm)
+
+        fake_llm = FakeLLM()
+        plugin = MagicMock()
+        plugin.ctx.llm = fake_llm
+
+        config = {
+            "use_multi_round": False,
+            "min_activities": 8,
+            "max_activities": 15,
+            "enable_detailed_description": True,
+            "min_description_length": 10,
+            "max_description_length": 80,
+            "max_tokens": 8192,
+            "custom_prompt": "",
+            "timezone": "Asia/Shanghai",
+            "llm_task_name": "replyer",
+            "recent_schedule_days": 3,
+            "history_message_limit": 0,
+            "knowledge_search_limit": 0,
+            "llm_log_enabled": False,
+            "bot_profile": {
+                "personality": "旅行中的技术宅兽耳少女",
+                "reply_style": "短句嘴欠但靠谱",
+                "interest": "动漫、音乐、骑行和游戏",
+                "bot_name": "小甲",
+            },
+        }
+
+        with patch(f"{PKG_NAME}.planner.goal_manager.TimezoneManager", FrozenTimezoneManager), \
+             patch(f"{PKG_NAME}.planner.schedule_generator.TimezoneManager", FrozenTimezoneManager), \
+             patch(f"{PKG_NAME}.planner.generator.base_generator.TimezoneManager", FrozenTimezoneManager):
+            generator = sg_mod.ScheduleGenerator(gm, config, plugin=plugin)
+            schedule = await generator.generate_daily_schedule(
+                user_id="system",
+                chat_id="global",
+                use_llm=True,
+                use_multi_round=False,
+            )
+
+        assert len(schedule.items) == 10
+        generated_text = "\n".join([item.name for item in schedule.items] + [item.description for item in schedule.items])
+        assert "甲城" in generated_text
+
+        captured_prompt = fake_llm.prompts[0]
+        assert "06:40 乘坐热气球" in captured_prompt
+        assert "甲城" in captured_prompt
+
+    asyncio.run(run())
+
+
+@step("18. energy_model 时段能量基线")
 def test_energy_model():
     em = imp("utils.energy_model")
     # 时段能量曲线（极值）
@@ -890,6 +1082,8 @@ def main() -> int:
     test_replyer_inject()
     test_recent_schedule_summary()
     test_auto_scheduler()
+    test_future_time_word_detection()
+    test_daily_generation_uses_recent_context()
     test_energy_model()
     test_proactive_inject()
     test_v43_inject_enhancements()

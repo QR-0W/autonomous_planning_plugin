@@ -123,6 +123,7 @@ class PromptBuilder:
             and "记不太清" not in yesterday_text
             and "普通的" not in yesterday_text
             and "没有具体记录" not in yesterday_text
+            and "没有具体日程记录" not in yesterday_text
         )
 
         # 核心提示词（bot_name / personality 缺失时不出现悬挂逗号或孤立"你是"）
