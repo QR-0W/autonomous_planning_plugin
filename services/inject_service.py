@@ -33,7 +33,7 @@ import asyncio
 import logging
 import re
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from ..cache.lru_cache import LRUCache
 from ..handlers.exception_handler import handle_exception, handle_exception_silent
@@ -319,6 +319,87 @@ class InjectService:
             lines.append(f"接下来 {time_str} 要 {name}。")
         lines.append("⚠️ 不要主动提及；仅在用户问到 / 强相关时自然带过。")
         return "\n".join(lines)
+
+    async def inject_into_planner_items(
+        self,
+        items: List[Dict[str, Any]],
+        session_id: str,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """适配 MaiBot 1.2.x 的结构化 Planner Hook Items。
+
+        日程注入逻辑仍复用旧的消息字典实现；未知的 Context Item（例如
+        reasoning、tool call）不参与意图提取，但会在返回载荷中原样保留。
+        """
+        messages: List[Dict[str, Any]] = []
+        message_indexes: List[int] = []
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("item_type") or "")
+            role = {
+                "SystemMessageItem": "system",
+                "UserMessageItem": "user",
+                "AssistantMessageItem": "assistant",
+                "FunctionCallOutputItem": "tool",
+            }.get(item_type)
+            if not role:
+                continue
+            content_parts = item.get("parts") or []
+            content: List[Dict[str, Any]] = []
+            for part in content_parts:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    content.append({"type": "text", "text": str(part.get("text") or "")})
+                elif isinstance(part, dict) and part.get("type") == "image":
+                    content.append(dict(part))
+            if not content:
+                continue
+            messages.append({"role": role, "content": content})
+            message_indexes.append(index)
+
+        result = await self.inject_into_planner_messages(
+            messages=messages, session_id=session_id, **kwargs,
+        )
+        modified_messages = result.get("modified_kwargs", {}).get("messages")
+        if not isinstance(modified_messages, list) or len(modified_messages) <= len(messages):
+            return {"action": result.get("action", "continue")}
+
+        # 旧适配器只会插入一条 system 消息；定位新增项并生成 1.2.x 快照。
+        inserted_at = next(
+            (i for i, message in enumerate(modified_messages)
+             if i >= len(messages) or message != messages[i]),
+            0,
+        )
+        inserted_message = modified_messages[inserted_at]
+        if not isinstance(inserted_message, dict):
+            return {"action": "continue"}
+        content = inserted_message.get("content")
+        if isinstance(content, str):
+            content_parts = [{"type": "text", "text": content}]
+        elif isinstance(content, list):
+            content_parts = [part for part in content if isinstance(part, dict) and part.get("type") == "text"]
+        else:
+            return {"action": "continue"}
+        if not content_parts:
+            return {"action": "continue"}
+
+        injected_item = {
+            "item_type": "SystemMessageItem",
+            "meta": {
+                "item_id": f"autonomous-planning-injection-{id(self)}-{datetime.now().timestamp()}",
+                "logical_turn_id": None,
+                "timestamp": datetime.now().isoformat(),
+            },
+            "parts": content_parts,
+        }
+        modified_items = list(items)
+        # 注入策略位于第一个 system 后；按消息序号映射回原 Items。
+        if inserted_at < len(message_indexes):
+            target = message_indexes[inserted_at]
+            modified_items.insert(target, injected_item)
+        else:
+            modified_items.insert(len(items), injected_item)
+        return {"action": "continue", "modified_kwargs": {"items": modified_items}}
 
     async def inject_into_planner_messages(
         self,

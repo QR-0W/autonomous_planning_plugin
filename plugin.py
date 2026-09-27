@@ -269,6 +269,15 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
             "timezone": cfg.timezone,
             "llm_task_name": cfg.llm_task_name,
             "recent_schedule_days": cfg.recent_schedule_days,
+            "continuity_validation_enabled": cfg.continuity_validation_enabled,
+            "infer_lookback_days": cfg.infer_lookback_days,
+            "infer_max_prompt_chars": cfg.infer_max_prompt_chars,
+            "infer_use_completion_signal": cfg.infer_use_completion_signal,
+            "history_message_limit": cfg.history_message_limit,
+            "knowledge_search_limit": cfg.knowledge_search_limit,
+            "allowed_streams": list(cfg.allowed_streams or []),
+            "cross_day_activity": cfg.cross_day_activity,
+            "llm_log_enabled": cfg.llm_log_enabled,
             "bot_profile": dict(self._bot_profile) if self._bot_profile else {},
         }
 
@@ -570,13 +579,24 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
     )
     async def handle_inject_schedule(
         self,
-        messages: List[Dict[str, Any]] | None = None,
+        items: List[Dict[str, Any]] | None = None,
         session_id: str = "",
+        messages: List[Dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """日程注入 Hook 入口，转发给 InjectService。"""
+        """日程注入 Hook 入口，兼容 1.2.x 的 Context Items 与旧消息载荷。"""
         if self._inject_svc is None or not self.config.schedule.inject_schedule:
             return {"action": "continue"}
+
+        # MaiBot 1.2.x 的 Planner Hook 使用结构化 items；插件业务层仍以
+        # OpenAI 风格消息字典处理，因此先转换，返回时再转换回 items 快照。
+        if isinstance(items, list):
+            return await self._inject_svc.inject_into_planner_items(
+                items=items,
+                session_id=session_id,
+                **kwargs,
+            )
+
         return await self._inject_svc.inject_into_planner_messages(
             messages=messages or [],
             session_id=session_id,

@@ -252,12 +252,24 @@ class ScheduleSemanticValidator:
         # 2. 按开始时间排序
         time_blocks.sort(key=lambda x: x["start"])
 
-        # 3. 检查相邻活动之间的空档
+        # 3. 检查相邻活动之间的空档和重叠
         for i in range(len(time_blocks) - 1):
+            current_name = time_blocks[i]["name"]
             current_end = time_blocks[i]["end"]
+            next_name = time_blocks[i + 1]["name"]
             next_start = time_blocks[i + 1]["start"]
 
-            if next_start > current_end:
+            overlap_minutes = current_end - next_start
+
+            if overlap_minutes > 0:
+                # 重叠：当前活动还没结束，下一个就开始了
+                current_end_time = f"{current_end // 60:02d}:{current_end % 60:02d}"
+                next_start_time = f"{next_start // 60:02d}:{next_start % 60:02d}"
+                warnings.append(
+                    f"⚠️ 时间重叠：「{current_name}」({current_end_time}结束) 与 "
+                    f"「{next_name}」({next_start_time}开始) 重叠 {overlap_minutes} 分钟"
+                )
+            elif next_start > current_end:
                 gap_minutes = next_start - current_end
                 gap_hours = gap_minutes / 60.0
 

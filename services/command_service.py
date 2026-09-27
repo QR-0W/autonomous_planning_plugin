@@ -49,6 +49,7 @@ class CommandService:
             plugin: 当前插件实例
         """
         self._plugin = plugin
+        self._regenerate_running: bool = False
         logger.debug("CommandService 初始化")
 
     # ------------------------------------------------------------
@@ -265,21 +266,15 @@ class CommandService:
     async def _handle_regenerate(self, stream_id: str, parts: List[str]) -> None:
         """``/plan regenerate [额外要求...]``：立即重新生成今日日程。
 
-        会先删掉今天已有的 schedule_goals，再走 ``ScheduleGenerator`` 全量重生成并
-        自动 apply。``parts[2:]`` 拼成的剩余字符串将作为 ``extra_prompt`` 临时叠加
-        到 ``custom_prompt`` 上（生成完成后自动还原）。
-
-        Args:
-            stream_id: 来源会话 ID。
-            parts: 已 split 的命令片段，``parts[0]=/plan``，``parts[1]=regenerate``，
-                ``parts[2:]`` 为可选的额外要求文本。
+        v4.4.6: 改为后台异步执行。生成可能耗时 60-180s，如果在命令处理器里
+        同步等待会触发 SDK 的 invoke_command 超时（60s）。现在命令立即返回，
+        生成完成后通过 stream_id 回发结果。
         """
         tools_svc = self._plugin._tools_svc
         if tools_svc is None:
             await self._send(stream_id, "❌ 插件未完成初始化，无法重新生成日程")
             return
 
-        # 剩余参数拼为 extra_prompt（允许带空格的自然描述）
         extra_prompt = " ".join(parts[2:]).strip()
 
         hint = "♻️ 正在重新生成今日日程，请稍候（约 30s ~ 2min）..."
@@ -287,14 +282,30 @@ class CommandService:
             hint += f"\n📝 额外要求：{extra_prompt}"
         await self._send(stream_id, hint)
 
+        asyncio.create_task(self._do_regenerate(stream_id, extra_prompt))
+
+    async def _do_regenerate(self, stream_id: str, extra_prompt: str) -> None:
+        """后台执行 regenerate，完成后通过 stream_id 回发结果。"""
+        if self._regenerate_running:
+            await self._send(stream_id, "⚠️ 已有日程生成任务正在进行中，请等待完成")
+            return
+        self._regenerate_running = True
+        tools_svc = self._plugin._tools_svc
         try:
+            if tools_svc is None:
+                return
             schedule = await tools_svc.regenerate_today_schedule_now(extra_prompt=extra_prompt)
         except Exception as exc:
             logger.error(f"重新生成日程失败: {exc}", exc_info=True)
             await self._send(stream_id, f"❌ 重新生成失败: {exc}")
             return
+        finally:
+            self._regenerate_running = False
 
-        msg = f"✅ 已重新生成今日日程，共 {len(schedule.items)} 项活动\n\n💡 使用 /plan list 查看图片，或 /plan status 查看文字详情"
+        msg = (
+            f"✅ 已重新生成今日日程，共 {len(schedule.items)} 项活动\n\n"
+            "💡 使用 /plan list 查看图片，或 /plan status 查看文字详情"
+        )
         await self._send(stream_id, msg)
 
     async def _handle_delete(self, stream_id: str, parts: List[str]) -> Tuple[bool, str, bool]:

@@ -11,7 +11,7 @@ placeholder / rows / item_type / input_type 等），WebUI 据此渲染表单；
 
 字段编排按 ``order`` 数字分组（schedule 段）：
     1-9    日程注入开关
-    10-29  日程生成参数
+    10-29  日程生成参数 / 连续性约束
     30-49  定时 / 次日推断
     50-59  跨群上下文 + 跨天活动
     60-69  LLM 调用 / 日志归档
@@ -50,7 +50,7 @@ class PluginSectionConfig(PluginConfigBase):
         },
     )
     config_version: str = Field(
-        default="4.4.5",
+        default="4.4.6",
         description="配置文件版本号",
         json_schema_extra={
             "label": "配置版本",
@@ -84,12 +84,12 @@ class AutonomousPlanningConfig(PluginConfigBase):
         },
     )
     cleanup_old_goals_days: int = Field(
-        default=30,
+        default=365,
         ge=1,
         description="保留多少天前的已完成 / 取消目标。",
         json_schema_extra={
             "label": "保留天数",
-            "hint": "天；超过此天数的旧目标（完成/取消）自动删除",
+            "hint": "天；长期旅行建议 180-365，超过此天数的旧目标（完成/取消）自动删除",
             "order": 2,
         },
     )
@@ -153,10 +153,10 @@ class ScheduleConfig(PluginConfigBase):
 
     custom_prompt: str = Field(
         default="",
-        description="自定义日程生成提示词（如\"今天想多运动\"、\"专注学习\"等，留空使用默认风格）。",
+        description="角色当前所处的长期生活阶段/状态（如\"正在环游世界\"、\"备考研究生中\"）。不是一次性今日要求，而是持续的人生阶段。留空则由系统自动推断。",
         json_schema_extra={
-            "label": "自定义生成 prompt",
-            "hint": "留空使用默认；如\"今天想多运动\"\"专注学习\"",
+            "label": "当前生活阶段",
+            "hint": "留空=自动推断。建议填长期状态而非一日要求，如\"环游世界\"而非\"今天去博物馆\"",
             "rows": 3,
             "placeholder": "（留空使用默认风格）",
             "order": 10,
@@ -266,11 +266,20 @@ class ScheduleConfig(PluginConfigBase):
         default=3,
         ge=1,
         le=14,
-        description="生成新日程时回看最近 N 天的日程作为去重参考。N=1 = 只看昨天（旧行为）；N=3-5 推荐。",
+        description="生成新日程时回看最近 N 天的日程作为连续性和去重参考。N=1 = 只看昨天（旧行为）；N=3-5 推荐。",
         json_schema_extra={
             "label": "回看天数",
-            "hint": "1-14；防止交替式重复（周一审稿/周二写专栏/周三又审稿）；推荐 3",
+            "hint": "1-14；承接近期地点/主线并防止交替式重复；推荐 3",
             "order": 21,
+        },
+    )
+    continuity_validation_enabled: bool = Field(
+        default=True,
+        description="启用连续性硬约束校验：近期存在旅行/地点/项目主线时，生成结果若完全未承接该主线则拒绝应用并重试。",
+        json_schema_extra={
+            "label": "连续性硬校验",
+            "hint": "防止明明在旅行/项目中，第二天却完全丢掉近期主线",
+            "order": 22,
         },
     )
 

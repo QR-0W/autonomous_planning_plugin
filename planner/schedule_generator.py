@@ -842,15 +842,32 @@ class ScheduleGenerator:
         gen_timeout_sec = float(getattr(self.config, 'generation_timeout', 180.0) or 180.0)
         rpc_timeout_ms = max(60_000, int(gen_timeout_sec * 1000))
 
+        # SDK 2.8+：任务名必须通过 task_name 传递，model 仅表示具体模型名。
         llm_result = await self._plugin.ctx.llm.generate(
             prompt=prompt,
-            model=task_name,
+            task_name=task_name,
             max_tokens=max_tokens,
             temperature=temperature,
             timeout_ms=rpc_timeout_ms,
         )
         success = bool(llm_result.get("success", False))
         response = str(llm_result.get("response", ""))
+
+        # Doubao Responses API 在某些配置下将内容放在嵌套路径
+        # raw_data.output[0].content[0].text 中，而顶层的 response/content
+        # 为空。这里尝试从 raw_data 中提取。
+        if not response and isinstance(llm_result.get("raw_data"), dict):
+            raw = llm_result["raw_data"]
+            for output_block in raw.get("output") or []:
+                if isinstance(output_block, dict):
+                    for content_block in output_block.get("content") or []:
+                        if isinstance(content_block, dict):
+                            text = str(content_block.get("text") or "").strip()
+                            if text:
+                                response = text
+                                break
+                    if response:
+                        break
 
         # 归档 LLM 调用（受配置开关控制；失败静默）
         self._archive_llm_call("schedule_generation", prompt, response, task_name, success)

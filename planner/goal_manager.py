@@ -630,13 +630,9 @@ class GoalManager:
                 has_time_window = True
 
             if has_time_window:
-                # Check creation date
-                goal_date = None
-                if goal.created_at:
-                    try:
-                        goal_date = goal.created_at.strftime("%Y-%m-%d")
-                    except Exception:
-                        pass
+                # Prefer explicit schedule_date written by ScheduleGenerator.
+                # Legacy rows do not have it, so created_at remains the fallback.
+                goal_date = self._get_goal_schedule_date(goal)
 
                 # Only return goals for specified dates
                 if goal_date in target_dates:
@@ -671,6 +667,29 @@ class GoalManager:
             return unique_goals
 
         return schedule_goals
+
+    @staticmethod
+    def _get_goal_schedule_date(goal: Goal) -> Optional[str]:
+        """Return the logical schedule date for a goal.
+
+        Older versions inferred the date solely from ``created_at``.  That is
+        fragile around midnight and for tests/maintenance scripts, so new
+        schedule rows store ``parameters.schedule_date`` explicitly while this
+        helper keeps old rows readable.
+        """
+        for container in (goal.parameters, goal.conditions):
+            if isinstance(container, dict):
+                raw_date = str(container.get("schedule_date") or "").strip()
+                if raw_date:
+                    return raw_date[:10]
+        if goal.created_at:
+            try:
+                if isinstance(goal.created_at, str):
+                    return goal.created_at.split("T")[0] if "T" in goal.created_at else goal.created_at[:10]
+                return goal.created_at.strftime("%Y-%m-%d")
+            except Exception:
+                return None
+        return None
 
     def update_goal(self, goal_id: str, **kwargs) -> bool:
         """Update goal fields.
@@ -827,14 +846,13 @@ class GoalManager:
             if not has_time_window:
                 continue  # 跳过非日程类型的目标
 
-            # 检查创建日期
-            if goal.created_at:
-                goal_date = goal.created_at.strftime("%Y-%m-%d")
-                if goal_date < today_str:
-                    # 这是昨天或更早的日程，标记为完成
-                    self.update_goal_status(goal.goal_id, GoalStatus.COMPLETED)
-                    expired_count += 1
-                    logger.debug(f"Marked expired schedule as completed: {goal.name} (created: {goal_date})")
+            # 检查逻辑日程日期（新行优先 schedule_date，旧行回退 created_at）
+            goal_date = self._get_goal_schedule_date(goal)
+            if goal_date and goal_date < today_str:
+                # 这是昨天或更早的日程，标记为完成
+                self.update_goal_status(goal.goal_id, GoalStatus.COMPLETED)
+                expired_count += 1
+                logger.debug(f"Marked expired schedule as completed: {goal.name} (schedule_date: {goal_date})")
 
         if expired_count > 0:
             logger.info(f"🧹 清理了 {expired_count} 个过期日程（昨天及更早）")

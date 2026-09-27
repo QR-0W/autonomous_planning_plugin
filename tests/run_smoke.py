@@ -13,7 +13,7 @@
 
 脚本顶部已强制 stdout/stderr 为 utf-8，不需要再设 ``PYTHONIOENCODING`` 环境变量。
 
-覆盖范围（15 项）：
+覆盖范围（23 项）：
     1.  插件包导入（验证 cache 模块未缺失）
     2.  组件注册（4 Tool + 1 Command + 1 EventHandler + 2 HookHandler + 1 API = 9-10 个）
     3.  UI Section 渲染（4 个顶层 section 全部可见、字段带 label/hint/order）
@@ -114,6 +114,10 @@ def mock_plugin(**schedule_overrides):
     plugin.config.schedule.timezone = "Asia/Shanghai"
     plugin.config.schedule.allowed_streams = []
     plugin.config.schedule.cross_day_activity = True
+    plugin.config.schedule.continuity_validation_enabled = True
+    plugin.config.schedule.infer_lookback_days = 3
+    plugin.config.schedule.infer_max_prompt_chars = 300
+    plugin.config.schedule.infer_use_completion_signal = True
     plugin.config.schedule.inject_schedule = True
     plugin.config.schedule.inject_into_replyer = True
     # v4.4 新增的主动行为配置：默认全部关闭，避免 ProactiveService 触发 ctx 调用
@@ -139,7 +143,7 @@ def mock_plugin(**schedule_overrides):
 
 @step("01. 插件包导入（cache 模块未缺失）")
 def test_pkg_import():
-    assert plugin_mod.__version__ == "4.4.5", f"version={plugin_mod.__version__}"
+    assert plugin_mod.__version__ == "4.4.6", f"version={plugin_mod.__version__}"
     cache_mod = imp("cache.lru_cache")
     c = cache_mod.LRUCache(max_size=2)
     c["a"] = 1; c["b"] = 2; c["c"] = 3
@@ -172,8 +176,9 @@ def test_components():
 @step("03. UI Section 渲染（4 个顶层 section + 字段 UI 元数据完整）")
 def test_ui_schema():
     inst = fresh_plugin()
-    assert inst.config.plugin.config_version == "4.4.5"
+    assert inst.config.plugin.config_version == "4.4.6"
     assert inst.config.schedule.auto_infer_next_day_prompt is True
+    assert inst.config.schedule.continuity_validation_enabled is True
     schema = inst.build_config_schema(plugin_id="x.y", plugin_name="t")
     sections = schema["sections"]
     assert set(sections.keys()) == {"plugin", "autonomous_planning", "schedule", "inject"}, \
@@ -222,7 +227,7 @@ def test_current_toml():
     assert isinstance(inst.config.schedule.inject_into_replyer, bool)
     # inject_mode 在 v4.2 起 deprecated 但保留向后兼容
     assert inst.config.inject.inject_mode in ("smart", "rule")
-    assert inst.config.plugin.config_version == "4.4.5"
+    assert inst.config.plugin.config_version == "4.4.6"
 
 
 @step("06. stream_filter 白名单匹配")
@@ -295,8 +300,9 @@ def test_prompt_builder():
     assert "今天需要纳入的约定" in prompt and "打游戏" in prompt
     assert "最近聊天背景" in prompt and "朵昕" in prompt
     assert "相关记忆参考" in prompt and "油豆腐" in prompt
-    assert "连续性要求" in prompt and "不要无理由回到默认学习、游戏、上班日常" in prompt
+    assert "连续性要求" in prompt and "不要无理由丢掉近期主线" in prompt
     assert "先从最近一天摘要提取当前地点" in prompt
+    assert "连续旅行/地点演化要求" in prompt
     assert "禁止照抄示例活动名" in prompt
     assert "跨天活动支持" in prompt
 
@@ -452,7 +458,25 @@ def test_recent_schedule_summary():
     assert "审稿" in s_yest
 
 
-@step("15. ScheduleAutoScheduler 构造 + start/stop（强类型 config 访问）")
+@step("15. 显式 schedule_date 驱动日程日期查询")
+def test_schedule_date_metadata_lookup():
+    gm_mod = imp("planner.goal_manager")
+    gm = gm_mod.GoalManager(data_dir=str(Path(tempfile.mkdtemp())))
+    goal = gm.create_goal(
+        name="抵达安塔利亚", description="今天抵达安塔利亚，入住海边酒店",
+        goal_type="custom", creator_id="system", chat_id="global", priority="medium",
+        parameters={"time_window": [9 * 60, 11 * 60], "schedule_date": "2026-06-20"},
+    )
+    # 模拟维护脚本/跨午夜场景：创建时间不等于逻辑日程日期。
+    gm.db.update_goal(goal.goal_id, created_at=datetime(2026, 6, 19, 23, 55))
+
+    got_target = gm.get_schedule_goals(chat_id="global", date_str="2026-06-20")
+    got_created = gm.get_schedule_goals(chat_id="global", date_str="2026-06-19")
+    assert [g.name for g in got_target] == ["抵达安塔利亚"]
+    assert not got_created, "有 schedule_date 时不应再按 created_at 归到前一天"
+
+
+@step("16. ScheduleAutoScheduler 构造 + start/stop（强类型 config 访问）")
 def test_auto_scheduler():
     sched_mod = imp("planner.auto_scheduler")
     inst = fresh_plugin()
@@ -484,7 +508,7 @@ def test_auto_scheduler():
     asyncio.run(run())
 
 
-@step("16. 模拟旅行连续性生成链路（6/18 旅行 → 6/19 承接）")
+@step("17. 模拟旅行连续性生成链路（6/18 旅行 → 6/19 承接）")
 def test_schedule_continuity_simulation():
     """临时 DB + fake LLM，验证普通每日生成主链路会吃到旅行连续上下文。"""
     from datetime import timedelta as _td
@@ -505,13 +529,13 @@ def test_schedule_continuity_simulation():
         def __init__(self):
             self.prompts: list[str] = []
 
-        async def generate(self, *, prompt, model, max_tokens, temperature):
-            del model, max_tokens, temperature
+        async def generate(self, *, prompt, model, max_tokens, temperature, timeout_ms=None):
+            del model, max_tokens, temperature, timeout_ms
             self.prompts.append(prompt)
             required = [
                 "今天是2026-06-19 周五",
                 "【连续性要求】",
-                "不要无理由回到默认学习、游戏、上班日常",
+                "不要无理由丢掉近期主线",
                 "06:40 乘坐热气球",
                 "卡帕多奇亚",
                 "先从最近一天摘要提取当前地点",
@@ -588,6 +612,7 @@ def test_schedule_continuity_simulation():
             "timezone": "Asia/Shanghai",
             "llm_task_name": "replyer",
             "recent_schedule_days": 3,
+            "continuity_validation_enabled": True,
             "history_message_limit": 0,
             "knowledge_search_limit": 0,
             "llm_log_enabled": False,
@@ -612,7 +637,6 @@ def test_schedule_continuity_simulation():
 
         assert len(schedule.items) == 15
         generated_text = "\n".join([item.name for item in schedule.items] + [item.description for item in schedule.items])
-        assert "学习线性代数" not in generated_text and "玩游戏" not in generated_text and "看动漫" not in generated_text
         for term in ("露天博物馆", "洞穴教堂", "红谷", "热气球"):
             assert term in generated_text, f"生成结果缺少旅行连续项: {term}"
 
@@ -624,7 +648,153 @@ def test_schedule_continuity_simulation():
     asyncio.run(run())
 
 
-@step("17. energy_model 时段能量基线")
+@step("18. 真实链路负向模拟：丢失旅行主线会被连续性硬约束重试")
+def test_continuity_rejects_missing_travel_context_and_retries():
+    """真实 ScheduleGenerator + 临时 DB：首轮不承接旅行主线必须被拒绝并触发第二轮。"""
+    from datetime import timedelta as _td
+
+    gm_mod = imp("planner.goal_manager")
+    sg_mod = imp("planner.schedule_generator")
+
+    frozen_now = datetime(2026, 6, 20, 8, 0)
+
+    class FrozenTimezoneManager:
+        def __init__(self, timezone_str: str = "Asia/Shanghai"):
+            self.timezone_str = timezone_str
+
+        def get_now(self):
+            return frozen_now
+
+    def make_item(name, desc, goal_type, priority, time_slot, duration):
+        return {
+            "name": name,
+            "description": desc,
+            "goal_type": goal_type,
+            "priority": priority,
+            "time_slot": time_slot,
+            "duration_hours": duration,
+        }
+
+    missing_context_daily = {
+        "schedule_items": [
+            make_item("睡觉", "普通睡觉，完全没有承接旅行线", "daily_routine", "high", "00:00", 7),
+            make_item("起床洗漱", "起床洗漱后准备普通的一天", "daily_routine", "medium", "07:00", 0.5),
+            make_item("早餐", "简单吃早餐，随后处理普通事项", "meal", "high", "07:30", 0.5),
+            make_item("上午整理资料", "整理资料和邮件，内容没有承接近期地点线", "custom", "medium", "08:00", 3),
+            make_item("午餐", "午餐吃点家常菜，休息一下", "meal", "high", "11:00", 1),
+            make_item("午休", "午休恢复精神，下午继续处理杂事", "daily_routine", "medium", "12:00", 1),
+            make_item("下午处理邮件", "继续处理邮件和零散事项", "custom", "medium", "13:00", 2),
+            make_item("听音乐放松", "听音乐放松，和朋友随便聊聊", "entertainment", "low", "15:00", 2),
+            make_item("室内阅读", "室内阅读消磨时间，今天很平静", "learn_topic", "low", "17:00", 1),
+            make_item("晚餐", "晚餐正常吃饭，没什么特别安排", "meal", "high", "18:00", 1),
+            make_item("夜聊", "夜聊分享普通生活小事", "social_maintenance", "medium", "19:00", 2),
+            make_item("睡前准备", "洗漱后准备睡觉", "daily_routine", "medium", "21:00", 3),
+        ]
+    }
+
+    travel_continuation = {
+        "schedule_items": [
+            make_item("睡觉", "在卡帕多奇亚洞穴酒店睡到清晨，保留旅途体力", "daily_routine", "high", "00:00", 7),
+            make_item("起床洗漱", "洗漱后检查行李，准备离开卡帕多奇亚", "daily_routine", "medium", "07:00", 0.5),
+            make_item("早餐", "吃洞穴酒店早餐，顺手确认去安塔利亚的车次", "meal", "high", "07:30", 0.5),
+            make_item("退房转场", "从卡帕多奇亚退房，带好行李前往车站", "custom", "high", "08:00", 1.5),
+            make_item("城际交通", "坐车从卡帕多奇亚去安塔利亚，路上整理照片", "custom", "high", "09:30", 2),
+            make_item("午餐", "途中简餐补能量，避免抵达后太疲惫", "meal", "high", "11:30", 1),
+            make_item("抵达安塔利亚", "抵达安塔利亚后先确认海边酒店位置", "custom", "high", "12:30", 1),
+            make_item("入住休整", "办理入住，冲个澡让长途交通的疲惫散掉", "daily_routine", "medium", "13:30", 1),
+            make_item("老城慢逛", "去安塔利亚老城慢慢走，适应新城市节奏", "custom", "medium", "14:30", 1.5),
+            make_item("港口看海", "到港口边看海风和船，接上旅程的新城市线", "custom", "medium", "16:00", 1),
+            make_item("晚餐", "晚餐吃安塔利亚当地菜，给明天海边行程补能", "meal", "high", "17:00", 1),
+            make_item("海边散步", "饭后沿海边散步，把卡帕多奇亚旅程过渡到海滨城市", "exercise", "medium", "18:00", 1.5),
+            make_item("夜聊", "和朋友聊从卡帕多奇亚到安塔利亚的转场见闻", "social_maintenance", "medium", "19:30", 1.5),
+            make_item("整理明日路线", "整理明天安塔利亚周边路线和交通时间", "custom", "medium", "21:00", 1),
+            make_item("睡前准备", "洗漱后早点睡，给新城市第一天收个稳尾", "daily_routine", "medium", "22:00", 2),
+        ]
+    }
+
+    class FakeLLM:
+        def __init__(self):
+            self.prompts: list[str] = []
+
+        async def generate(self, *, prompt, model, max_tokens, temperature, timeout_ms=None):
+            del model, max_tokens, temperature, timeout_ms
+            self.prompts.append(prompt)
+            body = missing_context_daily if len(self.prompts) == 1 else travel_continuation
+            return {"success": True, "response": json.dumps(body, ensure_ascii=False)}
+
+    def create_three_day_cappadocia_history(gm):
+        for offset in range(1, 4):
+            day = frozen_now - _td(days=offset)
+            day_str = day.strftime("%Y-%m-%d")
+            for name, desc, start, end in [
+                ("卡帕多奇亚清晨行程", "在卡帕多奇亚和格雷梅附近继续旅行，整理热气球照片", 8 * 60, 10 * 60),
+                ("洞穴酒店休整", "回卡帕多奇亚洞穴酒店休整，准备后续城市转场", 14 * 60, 16 * 60),
+                ("观景台看日落", "在卡帕多奇亚观景台看日落，确认之后去安塔利亚", 18 * 60, 20 * 60),
+            ]:
+                goal = gm.create_goal(
+                    name=name, description=desc, goal_type="custom",
+                    creator_id="system", chat_id="global", priority="medium",
+                    parameters={"time_window": [start, end], "schedule_date": day_str},
+                )
+                gm.db.update_goal(goal.goal_id, created_at=day)
+
+    async def run():
+        gm = gm_mod.GoalManager(data_dir=str(Path(tempfile.mkdtemp())))
+        create_three_day_cappadocia_history(gm)
+
+        fake_llm = FakeLLM()
+        plugin = MagicMock()
+        plugin.ctx.llm = fake_llm
+        plugin._plugin_root = None
+
+        config = {
+            "use_multi_round": True,
+            "max_rounds": 2,
+            "quality_threshold": 0.85,
+            "min_activities": 8,
+            "max_activities": 15,
+            "enable_detailed_description": True,
+            "min_description_length": 8,
+            "max_description_length": 90,
+            "max_tokens": 8192,
+            "custom_prompt": "",
+            "timezone": "Asia/Shanghai",
+            "llm_task_name": "replyer",
+            "recent_schedule_days": 3,
+            "continuity_validation_enabled": True,
+            "history_message_limit": 0,
+            "knowledge_search_limit": 0,
+            "llm_log_enabled": False,
+            "bot_profile": {
+                "personality": "旅行中的技术宅兽耳少女",
+                "reply_style": "短句嘴欠但靠谱",
+                "interest": "动漫、音乐、骑行和游戏",
+                "bot_name": "哈基米",
+            },
+        }
+
+        with patch(f"{PKG_NAME}.planner.goal_manager.TimezoneManager", FrozenTimezoneManager), \
+             patch(f"{PKG_NAME}.planner.schedule_generator.TimezoneManager", FrozenTimezoneManager), \
+             patch(f"{PKG_NAME}.planner.generator.base_generator.TimezoneManager", FrozenTimezoneManager):
+            generator = sg_mod.ScheduleGenerator(gm, config, plugin=plugin)
+            schedule = await generator.generate_daily_schedule(
+                user_id="system",
+                chat_id="global",
+                use_llm=True,
+                use_multi_round=True,
+            )
+
+        assert len(fake_llm.prompts) == 2, "丢失旅行主线的首轮应触发连续性硬约束重试"
+        assert "连续性硬约束" in fake_llm.prompts[1], "第二轮 prompt 应包含首轮硬约束反馈"
+        assert "连续旅行/地点演化要求" in fake_llm.prompts[0], "首轮 prompt 应明确连续旅行上下文"
+        generated_text = "\n".join([item.name for item in schedule.items] + [item.description for item in schedule.items])
+        assert "卡帕多奇亚" in generated_text and "安塔利亚" in generated_text
+        assert "退房" in generated_text and "抵达" in generated_text
+
+    asyncio.run(run())
+
+
+@step("19. energy_model 时段能量基线")
 def test_energy_model():
     em = imp("utils.energy_model")
     # 时段能量曲线（极值）
@@ -646,7 +816,7 @@ def test_energy_model():
     assert em.get_energy_level(99) == em.get_energy_level(23)
 
 
-@step("18. InjectOptimizer 主动碎碎念配额 + 间隔 + 概率")
+@step("20. InjectOptimizer 主动碎碎念配额 + 间隔 + 概率")
 def test_proactive_inject():
     inj_mod = imp("handlers.inject.inject_optimizer")
     # 把概率拉到 1，去掉随机性；配额 2、间隔 0 秒
@@ -692,7 +862,7 @@ def test_proactive_inject():
     assert not ok and "间隔" in reason
 
 
-@step("19. 注入文本 v4.3 增强（state_hint + 精神状态 + 主动碎碎念语气切换）")
+@step("21. 注入文本 v4.3 增强（state_hint + 精神状态 + 主动碎碎念语气切换）")
 def test_v43_inject_enhancements():
     gm_mod = imp("planner.goal_manager")
     gm = gm_mod.GoalManager(data_dir=str(Path(tempfile.mkdtemp())))
@@ -764,7 +934,7 @@ def test_v43_inject_enhancements():
     asyncio.run(run_replyer())
 
 
-@step("20. _extract_last_user_text 跳过主程序元数据消息（v4.3.2/v4.4.1/v4.4.2 hotfix）")
+@step("22. _extract_last_user_text 跳过主程序元数据消息（v4.3.2/v4.4.1/v4.4.2 hotfix）")
 def test_extract_last_user_text_skip_time_prefix():
     inj_mod = imp("services.inject_service")
     extract = inj_mod.InjectService._extract_last_user_text
@@ -898,7 +1068,7 @@ def test_extract_last_user_text_skip_time_prefix():
     assert intent_t == UserIntent.TECH_QUESTION, f"'怎么配置数据库连接'应判为 tech_question，实际 {intent_t}"
 
 
-@step("21. ProactiveService 主动发起 + 频率调控 + 多格式 stream 解析（v4.4 / v4.4.1）")
+@step("23. ProactiveService 主动发起 + 频率调控 + 多格式 stream 解析（v4.4 / v4.4.1）")
 def test_proactive_service():
     from unittest.mock import AsyncMock
 
@@ -1051,8 +1221,10 @@ def main() -> int:
     test_api_snapshot()
     test_replyer_inject()
     test_recent_schedule_summary()
+    test_schedule_date_metadata_lookup()
     test_auto_scheduler()
     test_schedule_continuity_simulation()
+    test_continuity_rejects_missing_travel_context_and_retries()
     test_energy_model()
     test_proactive_inject()
     test_v43_inject_enhancements()

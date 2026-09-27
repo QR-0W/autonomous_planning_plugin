@@ -78,6 +78,9 @@ class ScheduleGeneratorConfig:
         # === 自定义Prompt ===
         self.custom_prompt = config_dict.get('custom_prompt', '').strip()
 
+        # === 连续性校验 ===
+        self.continuity_validation_enabled = config_dict.get('continuity_validation_enabled', True)
+
         # === 缓存配置 ===
         self.cache_ttl = config_dict.get('cache_ttl', 300)
         self.cache_max_size = config_dict.get('cache_max_size', 100)
@@ -195,6 +198,7 @@ class ScheduleGeneratorConfig:
             'max_tokens': self.max_tokens,
             'generation_timeout': self.generation_timeout,
             'custom_prompt': self.custom_prompt,
+            'continuity_validation_enabled': self.continuity_validation_enabled,
             'cache_ttl': self.cache_ttl,
             'cache_max_size': self.cache_max_size,
             # v4 新增：LLM 任务名 + bot 全局配置 + 时区

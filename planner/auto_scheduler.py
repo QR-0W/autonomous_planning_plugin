@@ -219,6 +219,11 @@ class ScheduleAutoScheduler:
                 priority = goal.priority.value if hasattr(goal.priority, "value") else str(goal.priority)
                 goal_type = str(goal.goal_type or "custom")
                 item = f"- {time_text} {goal.name} ({goal_type}/{priority})"
+                desc = " ".join(str(getattr(goal, "description", "") or "").split())
+                if desc and desc != str(goal.name):
+                    if len(desc) > 64:
+                        desc = desc[:64].rstrip() + "…"
+                    item += f" — {desc}"
 
                 if include_completion:
                     # Goal 上的 status 一定存在；progress 在 core.models 中类型为 int 默认 0
@@ -240,7 +245,6 @@ class ScheduleAutoScheduler:
         max_chars = max(80, min(800, max_chars))
 
         include_completion = bool(schedule_config.get("infer_use_completion_signal", True))
-
         goal_manager = self.get_goal_manager()
         history_summary = self._build_recent_schedule_summary(goal_manager, lookback_days, include_completion)
         if not history_summary.strip():
@@ -256,22 +260,31 @@ class ScheduleAutoScheduler:
 
         instruction = (
             "你是日程策略设计助手。"
-            "请基于最近几天的日程与完成状态，为下面给出的目标日期生成一段中文'策略提示词'，"
+            "角色的长期状态（如果非空）是你最重要的参考——策略必须延续这个状态，不要让它突然结束。"
+            "近期日程是这个长期状态在最近几天的具体表现，用于判断当前进展和下一步方向。"
+            "请为下面给出的目标日期生成一段中文'策略提示词'，"
             "用于指导该目标日期的日程生成。"
             "输出必须是单段纯文本，不要Markdown、不要列表、不要解释。"
-            f"长度控制在120到{max_chars}字之间，强调连续性与现实可执行性。"
-            "如果基础要求存在，必须兼容且优先满足。"
-            "这段策略会在目标日期当天作为【特殊要求】使用，所以必须从目标日期当天视角描述，"
+            f"长度控制在120到{max_chars}字之间。"
+            "这段策略会在目标日期当天作为当日提示使用，所以必须从目标日期当天视角描述，"
             "使用'今天'或'当天'，禁止使用'明天'、'明日'、'次日'、'翌日'、'第二天'等相对未来词。"
         )
 
-        prompt = (
-            f"{instruction}\n\n"
-            f"目标日期：{target_date} {target_weekday}\n"
-            f"基础固定要求（可为空）：{base_prompt if base_prompt else '无'}\n\n"
-            f"最近日程历史：\n{history_summary}\n\n"
-            "请直接输出策略提示词正文："
-        )
+        if base_prompt:
+            prompt = (
+                f"{instruction}\n\n"
+                f"目标日期：{target_date} {target_weekday}\n"
+                f"【角色的长期状态】这是角色正在经历的持续人生阶段，策略必须自然延续这个状态，不要让它突然结束：\n{base_prompt}\n\n"
+                f"最近日程历史（长期状态在近期的具体表现）：\n{history_summary}\n\n"
+                "请直接输出策略提示词正文："
+            )
+        else:
+            prompt = (
+                f"{instruction}\n\n"
+                f"目标日期：{target_date} {target_weekday}\n\n"
+                f"最近日程历史：\n{history_summary}\n\n"
+                "请直接输出策略提示词正文："
+            )
 
         try:
             model_helper = BaseScheduleGenerator(goal_manager, schedule_config)
@@ -283,9 +296,10 @@ class ScheduleAutoScheduler:
             if self.plugin is None or not hasattr(self.plugin, "ctx"):
                 raise RuntimeError("ScheduleAutoScheduler 未注入 plugin 实例，无法调用 ctx.llm.generate")
 
+            # SDK 2.8+：任务名必须通过 task_name 传递，model 仅表示具体模型名。
             llm_result = await self.plugin.ctx.llm.generate(
                 prompt=prompt,
-                model=task_name,
+                task_name=task_name,
                 max_tokens=infer_max_tokens,
                 temperature=infer_temperature,
             )
@@ -339,12 +353,21 @@ class ScheduleAutoScheduler:
         return normalized
 
     def _get_effective_custom_prompt(self, today: str, configured_prompt: str) -> str:
+        """合并长期生活阶段与当日推断策略。
+
+        配置的 custom_prompt 是角色持续的人生阶段（如"环游世界"），
+        推断的 next_day_prompt 是当日具体策略（如"探索棉花堡"）。
+        当二者都存在时，保留长期阶段作为底层锚点，避免推断系统在几轮后
+        丢失人生阶段上下文而导致叙事收敛到"回家"。
+        """
         inferred_date = str(self._inferred_prompt_cache.get("target_date", "") or "")
         inferred_prompt = str(self._inferred_prompt_cache.get("prompt", "") or "").strip()
         if inferred_date == today and inferred_prompt:
             normalized_prompt = self._normalize_inferred_prompt_for_target_day(inferred_prompt)
             if normalized_prompt != inferred_prompt:
                 self.logger.info("已将次日推断策略改写为目标日当天视角")
+            if configured_prompt:
+                return f"{normalized_prompt}\n\n【底层的长期状态——这是持续的人生阶段，今天的具体活动虽可变，但不能让这个阶段突然结束】\n{configured_prompt}"
             return normalized_prompt
         return configured_prompt
 
@@ -420,33 +443,9 @@ class ScheduleAutoScheduler:
 
             # 检查今天是否已有日程（修复：支持datetime对象）
             goal_manager = self.get_goal_manager()
-            goals = goal_manager.get_all_goals(chat_id="global")
-
-            today_has_schedule = False
-            today_schedule_count = 0
-
-            for goal in goals:
-                # 检查目标是否有time_window（日程类型）
-                time_window = None
-                if goal.parameters and "time_window" in goal.parameters:
-                    time_window = goal.parameters["time_window"]
-                elif goal.conditions and "time_window" in goal.conditions:
-                    time_window = goal.conditions["time_window"]
-
-                # 如果有time_window且创建时间是今天，说明已有日程
-                if time_window:
-                    created_at = goal.created_at
-                    goal_date = None
-
-                    # 支持字符串和datetime对象
-                    if isinstance(created_at, str):
-                        goal_date = created_at.split("T")[0] if "T" in created_at else created_at[:10]
-                    elif created_at:
-                        goal_date = created_at.strftime("%Y-%m-%d")
-
-                    if goal_date == today:
-                        today_has_schedule = True
-                        today_schedule_count += 1
+            existing_today = goal_manager.get_schedule_goals(chat_id="global", date_str=today)
+            today_has_schedule = bool(existing_today)
+            today_schedule_count = len(existing_today)
 
             if today_has_schedule:
                 self.logger.info(f"📅 今日已有 {today_schedule_count} 个日程，跳过自动生成")

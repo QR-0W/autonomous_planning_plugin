@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 import logging
 
 from ...utils.timezone_manager import TimezoneManager
+from .continuity_state import build_continuity_prompt_section
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +109,6 @@ class PromptBuilder:
 
         # 读取自定义prompt配置
         custom_prompt = self.config.get('custom_prompt', '').strip()
-
         # 使用时区管理器获取时间信息
         today = self.tz_manager.get_now()
         date_str = today.strftime("%Y-%m-%d")
@@ -141,6 +141,8 @@ class PromptBuilder:
         prompt_header = persona_line + style_block if persona_line else style_block.lstrip()
         prompt = f"""{prompt_header}
 
+以上是你的性格、语气和偏好（你是谁）。你当前所处的实际生活状态和地理位置由下方的历史日程与生活阶段决定，不由人格文本中的隐含场景决定。保持你的性格特质和表达风格，但你在哪、做什么——以当前生活阶段为准。
+
 今天是{date_str} {weekday}{"（周末）" if is_weekend else ""}
 
 【最近几天日程参考】
@@ -156,9 +158,10 @@ class PromptBuilder:
 【连续性要求】
 - 【最近几天日程参考】是角色当前生活、旅行或长期项目的连续上下文，不只是避免重复的素材。
 - 先从最近一天摘要提取当前地点、旅程、任务链、人物约定或未收尾活动，再决定今天如何承接。
-- 如果最近一天出现明确地点、旅程、任务链或剧情主线，今天必须自然承接并演化；不要无理由回到默认学习、游戏、上班日常。
+- 如果最近一天出现明确地点、旅程、任务链或剧情主线，今天必须自然承接并演化；不要无理由丢掉近期主线。
 - 在稳定作息框架内安排后续活动、转场、收尾或新的当地体验；只有【特殊要求】或【今天需要纳入的约定】明确冲突时才覆盖这条主线。
 """
+            prompt += build_continuity_prompt_section(yesterday_text)
 
         # 跨群历史背景（动态上下文）
         if history_context:
@@ -191,11 +194,12 @@ class PromptBuilder:
             commit_lines.append("要求：把上述约定安排到合适时间段（与已知作息冲突时优先约定），goal_type 用 social_maintenance 或对应类型。")
             prompt += "\n".join(commit_lines) + "\n"
 
-        # 添加自定义prompt（如果配置了）
+        # 添加当前生活阶段 + 今日重点（可能包含长期状态与当日推断策略）
         if custom_prompt:
             prompt += f"""
-【特殊要求】
+【当前生活阶段与今日重点】
 {custom_prompt}
+（以上描述了角色当前所处的人生阶段和今日需关注的重点，安排日程时保持与长期状态的一致性）
 """
 
         # 根据配置决定描述要求
@@ -215,6 +219,7 @@ class PromptBuilder:
 - 真实的人 ≠ 日程机器：同一作息框架下，每天的"做什么"与"心情"应有微变化
 - 例：早餐时段不变，但今天可能粥配油条，明天面包黄油；上午时段不变，但今天审稿子，明天写专栏
 - ⚠️ 若最近日程显示正在旅行、赶项目或参与连续事件，今天要承接这条主线，而不是突兀回到普通日常
+- ⚠️ 若最近日程显示旅行/地点线，今天要在现实交通约束内自然演化；不要瞬移换地点
 - ⚠️ 不要为了"特色"突破常识作息（凌晨跑步、跳过晚餐、午餐推到 16 点都不可以）
 - ⚠️ 不要为了"和昨天不同"而把作息打乱（睡觉时间、三餐时段必须正常）
 
@@ -258,15 +263,15 @@ daily_routine(作息)|meal(吃饭)|study(学习)|entertainment(娱乐)|social_ma
     {"name":"睡觉","description":""" + ('"蜷在被窝里睡得很香"' if enable_detailed_description else '""') + ""","goal_type":"daily_routine","priority":"high","time_slot":"00:00","duration_hours":7.5},
     {"name":"起床洗漱","description":""" + ('"迷迷糊糊爬起来刷牙洗脸"' if enable_detailed_description else '""') + ""","goal_type":"daily_routine","priority":"medium","time_slot":"07:30","duration_hours":0.5},
     {"name":"早餐","description":""" + ('"简单吃了点东西"' if enable_detailed_description else '""') + ""","goal_type":"meal","priority":"high","time_slot":"08:00","duration_hours":0.5},
-    {"name":"上午学习","description":""" + ('"认真看书学习新知识"' if enable_detailed_description else '""') + ""","goal_type":"study","priority":"high","time_slot":"08:30","duration_hours":3.5},
+    {"name":"上午主线活动","description":""" + ('"按今天主线处理具体事项"' if enable_detailed_description else '""') + ""","goal_type":"custom","priority":"high","time_slot":"08:30","duration_hours":3.5},
     {"name":"午餐","description":""" + ('"吃了喜欢的菜"' if enable_detailed_description else '""') + ""","goal_type":"meal","priority":"high","time_slot":"12:00","duration_hours":0.5},
     {"name":"午休","description":""" + ('"小憩一会儿恢复精力"' if enable_detailed_description else '""') + ""","goal_type":"daily_routine","priority":"medium","time_slot":"12:30","duration_hours":0.5},
-    {"name":"下午学习","description":""" + ('"继续努力完成学习任务"' if enable_detailed_description else '""') + ""","goal_type":"study","priority":"high","time_slot":"13:00","duration_hours":2.0},
+    {"name":"下午主线推进","description":""" + ('"继续推进今天独有的安排"' if enable_detailed_description else '""') + ""","goal_type":"custom","priority":"high","time_slot":"13:00","duration_hours":2.0},
     {"name":"兴趣活动","description":""" + ('"做自己喜欢的事情"' if enable_detailed_description else '""') + ""","goal_type":"learn_topic","priority":"medium","time_slot":"15:00","duration_hours":2.0},
     {"name":"运动","description":""" + ('"出去跑步锻炼身体"' if enable_detailed_description else '""') + ""","goal_type":"exercise","priority":"medium","time_slot":"17:00","duration_hours":1.0},
     {"name":"晚餐","description":""" + ('"吃了丰盛的晚餐"' if enable_detailed_description else '""') + ""","goal_type":"meal","priority":"high","time_slot":"18:00","duration_hours":0.5},
     {"name":"娱乐","description":""" + ('"看视频放松一下"' if enable_detailed_description else '""') + ""","goal_type":"entertainment","priority":"low","time_slot":"18:30","duration_hours":3.0},
-    {"name":"夜聊","description":""" + ('"和朋友聊天分享日常"' if enable_detailed_description else '""') + ""","goal_type":"social_maintenance","priority":"medium","time_slot":"21:30","duration_hours":1.0},
+    {"name":"晚间分享","description":""" + ('"和朋友聊聊今天的具体见闻"' if enable_detailed_description else '""') + ""","goal_type":"social_maintenance","priority":"medium","time_slot":"21:30","duration_hours":1.0},
     {"name":"睡前准备","description":""" + ('"洗澡护肤准备睡觉"' if enable_detailed_description else '""') + ""","goal_type":"daily_routine","priority":"medium","time_slot":"22:30","duration_hours":1.5}
 """
 
@@ -277,7 +282,7 @@ daily_routine(作息)|meal(吃饭)|study(学习)|entertainment(娱乐)|social_ma
 ⚠️ 重要：上面示例展示了全天无缝衔接的正确方式！
 - 睡觉 00:00 + 7.5h = 07:30 → 起床洗漱 07:30 ✅ 无缝
 - 起床洗漱 07:30 + 0.5h = 08:00 → 早餐 08:00 ✅ 无缝
-- 早餐 08:00 + 0.5h = 08:30 → 上午学习 08:30 ✅ 无缝
+- 早餐 08:00 + 0.5h = 08:30 → 上午主线活动 08:30 ✅ 无缝
 ... (以此类推，每个活动结束时间 = 下个活动开始时间)
 - 睡前准备 22:30 + 1.5h = 24:00 (00:00) ✅ 回到起点，完整覆盖全天
 
