@@ -529,8 +529,8 @@ def test_schedule_continuity_simulation():
         def __init__(self):
             self.prompts: list[str] = []
 
-        async def generate(self, *, prompt, model, max_tokens, temperature, timeout_ms=None):
-            del model, max_tokens, temperature, timeout_ms
+        async def generate(self, *, prompt, model=None, max_tokens=None, temperature=None, timeout_ms=None, task_name=None):
+            del model, max_tokens, temperature, timeout_ms, task_name
             self.prompts.append(prompt)
             required = [
                 "今天是2026-06-19 周五",
@@ -716,8 +716,8 @@ def test_continuity_rejects_missing_travel_context_and_retries():
         def __init__(self):
             self.prompts: list[str] = []
 
-        async def generate(self, *, prompt, model, max_tokens, temperature, timeout_ms=None):
-            del model, max_tokens, temperature, timeout_ms
+        async def generate(self, *, prompt, model=None, max_tokens=None, temperature=None, timeout_ms=None, task_name=None):
+            del model, max_tokens, temperature, timeout_ms, task_name
             self.prompts.append(prompt)
             body = missing_context_daily if len(self.prompts) == 1 else travel_continuation
             return {"success": True, "response": json.dumps(body, ensure_ascii=False)}
