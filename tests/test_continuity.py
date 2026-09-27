@@ -8,7 +8,7 @@ Tests the ``continuity_state`` module's core functions in isolation:
   - build_continuity_prompt_section
 
 Also tests the GoalManager → context_loader → continuity pipeline
-with the real ``data/goals.db``.
+against an isolated temp database seeded with deterministic schedule goals.
 """
 
 from __future__ import annotations
@@ -68,9 +68,20 @@ def tz_mod(imp):
 
 
 @pytest.fixture
-def goal_mgr(gm_mod, data_dir):
-    """GoalManager pointed at the real data/goals.db."""
-    return gm_mod.GoalManager(data_dir=str(data_dir))
+def seeded_gm(gm_mod, tz_mod, data_dir):
+    """GoalManager on a per-test temp DB, seeded with 3 days of trip history + today."""
+    tz = tz_mod.TimezoneManager("Asia/Shanghai")
+    gm = gm_mod.GoalManager(data_dir=str(data_dir))
+    today = tz.get_now()
+    dates = {
+        offset: (today - timedelta(days=offset)).strftime("%Y-%m-%d")
+        for offset in range(4)
+    }
+    for offset in range(4):
+        names = ORDINARY_DAY_NAMES if offset == 0 else TRAVEL_DAY_NAMES
+        _seed_schedule_day(gm, dates[offset], names, start_hour=7 + (offset % 2))
+    yield gm, tz, dates
+    gm.close()
 
 
 # ============================================================
@@ -318,109 +329,121 @@ class TestFindContinuityViolations:
 # ============================================================
 
 
+TRAVEL_DAY_NAMES: Sequence[str] = (
+    "在卡帕多奇亚乘坐热气球",
+    "参观格雷梅露天博物馆",
+    "整理行李",
+    "退房后前往安塔利亚",
+    "抵达安塔利亚并入住",
+    "在安塔利亚老城漫步",
+    "分享旅行感受",
+    "拍摄精灵烟囱",
+    "品尝当地晚餐",
+    "整理当天照片",
+    "查询下一站路线",
+    "写旅行手账",
+    "早睡恢复体力",
+)
+
+ORDINARY_DAY_NAMES: Sequence[str] = tuple(f"日常安排 {index:02d}" for index in range(1, 14))
+
+
+def _seed_schedule_day(gm, date_str: str, names: Sequence[str], *, start_hour: int = 7) -> None:
+    """Seed one day of schedule goals with deterministic time windows."""
+    for index, name in enumerate(names):
+        start = (start_hour + index) * 60
+        gm.create_goal(
+            name=name,
+            description=f"{date_str} 安排：{name}",
+            goal_type="schedule",
+            creator_id="pytest",
+            chat_id="global",
+            priority="medium",
+            parameters={
+                "time_window": [start, start + 45],
+                "schedule_date": date_str,
+            },
+        )
+
+
 class TestGoalManagerScheduleGoals:
-    """Tests against the real data/goals.db."""
+    """Schedule-query behavior against an isolated, seeded temp database."""
 
-    def test_today_returns_13_goals(self, gm_mod, data_dir):
-        """get_schedule_goals for today returns 13 items."""
-        gm = gm_mod.GoalManager(data_dir=str(data_dir))
-        goals = gm.get_schedule_goals(chat_id="global")
-        assert len(goals) == 13, f"Expected 13 schedule goals, got {len(goals)}"
+    def test_today_returns_seeded_goals(self, seeded_gm):
+        """get_schedule_goals for today returns exactly the seeded goals."""
+        gm, _tz, dates = seeded_gm
+        goals = gm.get_schedule_goals(chat_id="global", date_str=dates[0])
+        assert len(goals) == len(ORDINARY_DAY_NAMES)
+        assert {goal.name for goal in goals} == set(ORDINARY_DAY_NAMES)
 
-    def test_goals_have_time_window(self, gm_mod, data_dir):
-        """Each schedule goal has a time_window parameter."""
-        gm = gm_mod.GoalManager(data_dir=str(data_dir))
-        goals = gm.get_schedule_goals(chat_id="global")
-        for g in goals:
-            params = g.parameters or {}
-            assert "time_window" in params, f"Goal {g.name} missing time_window"
+    def test_goals_have_time_window(self, seeded_gm):
+        """Each schedule goal has a valid time_window parameter."""
+        gm, _tz, dates = seeded_gm
+        goals = gm.get_schedule_goals(chat_id="global", date_str=dates[0])
+        assert goals
+        for goal in goals:
+            params = goal.parameters or {}
+            assert "time_window" in params, f"Goal {goal.name} missing time_window"
+            start, end = params["time_window"]
+            assert isinstance(start, (int, float)) and isinstance(end, (int, float))
+            assert 0 <= start < end <= 24 * 60
 
-    def test_goals_sorted_by_time(self, gm_mod, data_dir):
-        """Schedule goals should be returned in ascending time order."""
-        gm = gm_mod.GoalManager(data_dir=str(data_dir))
-        goals = gm.get_schedule_goals(chat_id="global")
-        prev = -1
-        for g in goals:
-            tw = (g.parameters or {}).get("time_window", [0])
-            start = tw[0] if isinstance(tw, (list, tuple)) else 0
-            # In order of name (which is the DB query order), not necessarily sorted
-            # We just verify they all have valid time values
-            assert isinstance(start, (int, float))
+    def test_goals_filtered_by_schedule_date(self, seeded_gm):
+        """Only the requested day's goals are returned; no cross-day leakage."""
+        gm, _tz, dates = seeded_gm
+        today_goals = gm.get_schedule_goals(chat_id="global", date_str=dates[0])
+        yesterday_goals = gm.get_schedule_goals(chat_id="global", date_str=dates[1])
+        assert {goal.name for goal in yesterday_goals} == set(TRAVEL_DAY_NAMES)
+        assert not ({goal.name for goal in today_goals} & {goal.name for goal in yesterday_goals})
 
-    def test_yesterday_has_travel_context(self, gm_mod, tz_mod, data_dir):
-        """Yesterday's schedule contains travel-reference items."""
-        gm = gm_mod.GoalManager(data_dir=str(data_dir))
-        tz = tz_mod.TimezoneManager("Asia/Shanghai")
-        yesterday = (tz.get_now() - timedelta(days=1)).strftime("%Y-%m-%d")
-        goals = gm.get_schedule_goals(chat_id="global", date_str=yesterday)
-        names = [g.name for g in goals]
-        # Expect travel-related items for the multi-day trip
+    def test_yesterday_has_travel_context(self, seeded_gm):
+        """Yesterday's seeded schedule contains travel-reference items."""
+        gm, _tz, dates = seeded_gm
+        goals = gm.get_schedule_goals(chat_id="global", date_str=dates[1])
+        names = [goal.name for goal in goals]
         travel_keywords = ["整理行李", "行李", "旅行", "分享感受"]
-        found = any(any(kw in n for kw in travel_keywords) for n in names)
-        assert found, f"Yesterday's goals {names} lack travel keywords"
+        assert any(keyword in name for name in names for keyword in travel_keywords), names
 
-    def test_real_db_goal_count_across_days(self, gm_mod, tz_mod, data_dir):
-        """Multiple days all have 13 schedule goals."""
-        gm = gm_mod.GoalManager(data_dir=str(data_dir))
-        tz = tz_mod.TimezoneManager("Asia/Shanghai")
-        now = tz.get_now()
-        for offset in range(1, 4):
-            day = (now - timedelta(days=offset)).strftime("%Y-%m-%d")
-            goals = gm.get_schedule_goals(chat_id="global", date_str=day)
-            assert len(goals) == 13, (
-                f"{day} has {len(goals)} goals, expected 13"
+    def test_goal_count_across_days(self, seeded_gm):
+        """Each of the past three seeded days has the expected number of goals."""
+        gm, _tz, dates = seeded_gm
+        for offset in (1, 2, 3):
+            goals = gm.get_schedule_goals(chat_id="global", date_str=dates[offset])
+            assert len(goals) == len(TRAVEL_DAY_NAMES), (
+                f"{dates[offset]} has {len(goals)} goals"
             )
 
 
-# ============================================================
-# Tests: Context Loader → Continuity pipeline
-# ============================================================
-
-
 class TestContextLoaderContinuityPipeline:
-    """Integration: context_loader -> continuity_state with real DB."""
+    """Integration: context_loader -> continuity_state on an isolated temp DB."""
 
-    def test_load_recent_summary_contains_travel(self, imp, gm_mod, tz_mod, data_dir):
-        """Recent schedule summary loaded from real DB includes travel items."""
-        gm = gm_mod.GoalManager(data_dir=str(data_dir))
-        tz = tz_mod.TimezoneManager("Asia/Shanghai")
+    def test_load_recent_summary_contains_travel(self, imp, seeded_gm):
+        """Recent schedule summary built from seeded data includes travel items."""
+        gm, tz, _dates = seeded_gm
         loader_cls = imp("planner.generator.context_loader").ScheduleContextLoader
-        loader = loader_cls(gm, tz)
-
-        summary = loader.load_recent_schedule_summary(days=3)
+        summary = loader_cls(gm, tz).load_recent_schedule_summary(days=3)
         assert summary is not None
-        assert "整理行李" in summary or "分享感受" in summary or "旅行" in summary
+        assert "整理行李" in summary or "分享旅行感受" in summary or "旅行" in summary
+        assert "卡帕多奇亚" in summary
 
-    def test_continuity_state_from_real_summary(self, imp, gm_mod, tz_mod, data_dir, cs):
-        """Continuity state extracted from real DB summary detects travel context."""
-        gm = gm_mod.GoalManager(data_dir=str(data_dir))
-        tz = tz_mod.TimezoneManager("Asia/Shanghai")
+    def test_continuity_state_from_seeded_summary(self, imp, seeded_gm, cs):
+        """Continuity state extracted from the seeded summary detects travel context."""
+        gm, tz, _dates = seeded_gm
         loader_cls = imp("planner.generator.context_loader").ScheduleContextLoader
-        loader = loader_cls(gm, tz)
-
-        summary = loader.load_recent_schedule_summary(days=3)
+        summary = loader_cls(gm, tz).load_recent_schedule_summary(days=3)
         state = cs.extract_continuity_state(summary)
-        # The real data has travel context (multiple days + locations)
         assert state.has_recent_context
-        assert state.has_travel_context or state.has_strong_continuity, (
-            f"Expected travel/strong continuity from real data. "
-            f"recent_locs={state.recent_locations}, "
-            f"has_travel={state.has_travel_context}"
-        )
+        assert state.has_travel_context or state.has_strong_continuity
+        assert "卡帕多奇亚" in state.recent_locations
 
-    def test_continuity_prompt_from_real_summary(self, imp, gm_mod, tz_mod, data_dir, cs):
-        """build_continuity_prompt_section produces non-empty output from real DB."""
-        gm = gm_mod.GoalManager(data_dir=str(data_dir))
-        tz = tz_mod.TimezoneManager("Asia/Shanghai")
+    def test_continuity_prompt_from_seeded_summary(self, imp, seeded_gm, cs):
+        """build_continuity_prompt_section produces the expected section."""
+        gm, tz, _dates = seeded_gm
         loader_cls = imp("planner.generator.context_loader").ScheduleContextLoader
-        loader = loader_cls(gm, tz)
-
-        summary = loader.load_recent_schedule_summary(days=3)
+        summary = loader_cls(gm, tz).load_recent_schedule_summary(days=3)
         prompt_section = cs.build_continuity_prompt_section(summary)
-        if prompt_section:
-            assert "【连续旅行/地点演化要求】" in prompt_section
-            # Places like 卡帕多奇亚 may appear in real data
-            assert "瞬移式换地点" in prompt_section
+        assert "【连续旅行/地点演化要求】" in prompt_section
+        assert "瞬移式换地点" in prompt_section
 
 
 # ============================================================

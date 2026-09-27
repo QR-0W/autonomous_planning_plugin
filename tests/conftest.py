@@ -45,6 +45,8 @@ def imp(plugin_pkg: Any):
 
 
 @pytest.fixture
-def data_dir() -> Path:
-    """Path to the plugin's data directory (contains goals.db)."""
-    return PLUGIN_DIR / "data"
+def data_dir(tmp_path: Path) -> Path:
+    """Per-test isolated data directory (never the plugin's live ``data/``)."""
+    directory = tmp_path / "data"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
