@@ -204,12 +204,11 @@ class InjectService:
         Args:
             session_id: 当前会话 ID。
             attempt: 当前回复尝试序号（从 1 开始）；> 1 表示重试。
-            **kwargs: 其它 hook 参数（task_name / reference_info / ...），未使用。
+            **kwargs: 其它 Hook 参数；保留已有 extra_prompt，由 Hook 入口补全返回参数。
 
         Returns:
-            ``{"action": "continue"}`` 或 ``{"action": "continue", "modified_kwargs": {"extra_prompt": "..."}}``。
+            ``{"action": "continue"}`` 或包含追加后 extra_prompt 的修改结果。
         """
-        del kwargs
 
         cfg = self._plugin.config.schedule
         if not self._plugin.config.plugin.enabled or not cfg.inject_into_replyer:
@@ -262,7 +261,9 @@ class InjectService:
             logger.info(f"✅ replyer 注入: {current_activity}")
             return {
                 "action": "continue",
-                "modified_kwargs": {"extra_prompt": extra_prompt},
+                "modified_kwargs": {
+                    "extra_prompt": "\n\n".join(filter(None, [kwargs.get("extra_prompt", ""), extra_prompt])),
+                },
             }
 
         except Exception as exc:

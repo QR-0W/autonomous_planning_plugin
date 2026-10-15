@@ -591,17 +591,26 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
         # MaiBot 1.2.x 的 Planner Hook 使用结构化 items；插件业务层仍以
         # OpenAI 风格消息字典处理，因此先转换，返回时再转换回 items 快照。
         if isinstance(items, list):
-            return await self._inject_svc.inject_into_planner_items(
+            result = await self._inject_svc.inject_into_planner_items(
                 items=items,
                 session_id=session_id,
                 **kwargs,
             )
-
-        return await self._inject_svc.inject_into_planner_messages(
-            messages=messages or [],
-            session_id=session_id,
-            **kwargs,
-        )
+        else:
+            result = await self._inject_svc.inject_into_planner_messages(
+                messages=messages or [],
+                session_id=session_id,
+                **kwargs,
+            )
+        if "modified_kwargs" in result:
+            original = {**kwargs, "session_id": session_id}
+            if items is not None:
+                original["items"] = items
+            if messages is not None:
+                original["messages"] = messages
+            # Host 整体替换参数；显式绑定的参数也必须保留。
+            result["modified_kwargs"] = {**original, **result["modified_kwargs"]}
+        return result
 
     # v4.4.0 恢复：v4.3.1 误删此 HookHandler，但主程序 5/21 已通过 commit 478256f2
     # （feat: 支持回复器 Hook 指定模型）补上 ``maisaka.replyer.before_request`` hook。
@@ -622,11 +631,17 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
         """replyer 注入 Hook 入口，转发给 InjectService。"""
         if self._inject_svc is None or not self.config.schedule.inject_into_replyer:
             return {"action": "continue"}
-        return await self._inject_svc.inject_into_replyer_extra_prompt(
+        result = await self._inject_svc.inject_into_replyer_extra_prompt(
             session_id=session_id,
             attempt=attempt,
             **kwargs,
         )
+        if "modified_kwargs" in result:
+            result["modified_kwargs"] = {
+                **kwargs, "session_id": session_id, "attempt": attempt,
+                **result["modified_kwargs"],
+            }
+        return result
 
 
 def create_plugin() -> AutonomousPlanningPluginV4:
