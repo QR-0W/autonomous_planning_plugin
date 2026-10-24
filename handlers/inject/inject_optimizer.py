@@ -4,15 +4,15 @@
 通过记录注入历史、检查时间间隔等方式，优化注入策略。
 """
 
+from datetime import date as _date
+from typing import Dict, Optional, Tuple
+import logging
 import random
 import time
-from typing import Dict, Optional, Tuple
-
-from src.common.logger import get_logger
 
 from .intent_classifier import UserIntent
 
-logger = get_logger("autonomous_planning.inject_optimizer")
+logger = logging.getLogger(__name__)
 
 
 class InjectOptimizer:
@@ -24,8 +24,15 @@ class InjectOptimizer:
     3. 根据意图类型智能决策
     4. 管理注入历史缓存
 
+    **scope 维度说明**（v4.2 起明确）：
+        - ``user_id`` 参数实际由 InjectService 传入的 ``session_id``（即聊天流 ID），
+          意味着群聊内所有成员共享一份冷却历史 —— 群里 A 触发注入后，B 紧接着说话
+          会被冷却挡掉，避免群里多人各注一遍
+        - 私聊场景下 ``session_id`` 一般唯一对应单个用户，等价于按用户维度冷却
+        - 不要把 ``user_id`` 理解为发送者 QQ，否则群聊语义会出错
+
     Attributes:
-        inject_history: 用户注入历史缓存
+        inject_history: 按 scope（session_id）分桶的注入历史缓存
         cache_ttl: 缓存过期时间（秒）
         casual_inject_probability: 闲聊时注入概率
     """
@@ -33,24 +40,116 @@ class InjectOptimizer:
     def __init__(
         self,
         cache_ttl: int = 300,
-        casual_inject_probability: float = 0.5
+        casual_inject_probability: float = 0.5,
+        proactive_daily_quota: int = 3,
+        proactive_probability: float = 0.15,
+        proactive_gap_seconds: int = 1800,
     ):
         """初始化注入优化器
 
         Args:
             cache_ttl: 缓存过期时间（秒），默认300秒（5分钟）
             casual_inject_probability: 闲聊时注入概率（0-1），默认0.5
+            proactive_daily_quota: 每会话每天主动碎碎念最大次数，默认 3
+            proactive_probability: 单次命中主动碎碎念的概率（0-1），默认 0.15
+            proactive_gap_seconds: 同会话两次主动碎碎念最小间隔（秒），默认 1800（30 分钟）
         """
-        # 用户注入历史缓存
-        # 结构：{user_id: {last_time, last_activity, last_content, count}}
+        # 用户注入历史缓存（按 scope/session_id 分桶）
+        # 结构：{scope_id: {last_time, last_activity, last_content, count}}
         self.inject_history: Dict[str, Dict] = {}
+
+        # 主动碎碎念历史（v4.3 新增）
+        # 结构：{scope_id: {date: "YYYY-MM-DD", count: int, last_time: float}}
+        self.proactive_history: Dict[str, Dict] = {}
 
         self.cache_ttl = cache_ttl
         self.casual_inject_probability = casual_inject_probability
+        self.proactive_daily_quota = proactive_daily_quota
+        self.proactive_probability = proactive_probability
+        self.proactive_gap_seconds = proactive_gap_seconds
 
         logger.debug(
             f"注入优化器初始化完成: TTL={cache_ttl}秒, "
-            f"闲聊注入概率={casual_inject_probability}"
+            f"闲聊注入概率={casual_inject_probability}, "
+            f"主动碎碎念配额={proactive_daily_quota}/日 概率={proactive_probability} "
+            f"最小间隔={proactive_gap_seconds}秒"
+        )
+
+    def should_proactive_inject(
+        self,
+        scope_id: str,
+        current_activity: Optional[str],
+    ) -> Tuple[bool, Optional[str]]:
+        """判断是否触发"主动碎碎念"（v4.3 新增）。
+
+        碎碎念命中后，``_render_unified_prompt`` 会把闲聊场景的提示从
+        "如不相关请完全忽略"切到"可以自然带出当前活动"，让 LLM 倾向于
+        在回复中提一句当前在干嘛。
+
+        触发条件（全部满足）：
+            1. 有当前活动
+            2. 当天该会话主动碎碎念次数未超 ``proactive_daily_quota``
+            3. 距离上次主动碎碎念 ≥ ``proactive_gap_seconds`` 秒
+            4. 抛硬币命中 ``proactive_probability``
+
+        Args:
+            scope_id: 会话/聊天流 ID。
+            current_activity: 当前活动名（无活动直接返回 False）。
+
+        Returns:
+            (是否触发, 跳过原因)。``True`` 时调用方应同步调用
+            ``record_proactive_inject(scope_id)`` 记录命中。
+        """
+        if not current_activity:
+            return False, "无当前活动"
+
+        current_time = time.time()
+        today_str = _date.today().isoformat()
+
+        history = self.proactive_history.get(scope_id)
+        if history is None:
+            # 新会话：直接抛硬币
+            pass
+        else:
+            # 日期翻篇 → 重置配额
+            if history.get("date") != today_str:
+                self.proactive_history[scope_id] = {"date": today_str, "count": 0, "last_time": 0.0}
+                history = self.proactive_history[scope_id]
+            # 配额检查
+            if history.get("count", 0) >= self.proactive_daily_quota:
+                return False, f"今日配额已满（{history['count']}/{self.proactive_daily_quota}）"
+            # 间隔检查
+            last_time = history.get("last_time", 0.0)
+            if current_time - last_time < self.proactive_gap_seconds:
+                gap = int(current_time - last_time)
+                return False, f"距上次碎碎念仅 {gap} 秒，未到最小间隔"
+
+        # 概率检查
+        if random.random() > self.proactive_probability:
+            return False, f"概率未命中（p={self.proactive_probability}）"
+
+        return True, None
+
+    def record_proactive_inject(self, scope_id: str) -> None:
+        """记录一次主动碎碎念命中（v4.3 新增）。
+
+        Args:
+            scope_id: 会话/聊天流 ID。
+        """
+        today_str = _date.today().isoformat()
+        history = self.proactive_history.get(scope_id)
+        if history is None or history.get("date") != today_str:
+            self.proactive_history[scope_id] = {
+                "date": today_str,
+                "count": 1,
+                "last_time": time.time(),
+            }
+        else:
+            history["count"] = history.get("count", 0) + 1
+            history["last_time"] = time.time()
+        logger.debug(
+            f"主动碎碎念记录: scope={scope_id}, "
+            f"今日 {self.proactive_history[scope_id]['count']}/{self.proactive_daily_quota}"
         )
 
     def should_inject(

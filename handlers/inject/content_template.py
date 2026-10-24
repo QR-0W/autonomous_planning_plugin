@@ -4,15 +4,14 @@
 提供多样化的表达模板，避免千篇一律的注入文本。
 """
 
-import random
 from typing import List, Optional, Tuple
-
-from src.common.logger import get_logger
+import logging
+import random
 
 from .intent_classifier import UserIntent
 from .state_analyzer import ActivityState, ActivityStateAnalyzer
 
-logger = get_logger("autonomous_planning.content_template")
+logger = logging.getLogger(__name__)
 
 
 class ContentTemplateEngine:

@@ -14,13 +14,11 @@
 5. 保持向后兼容的公开API
 """
 
-import asyncio
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Dict, List, Optional
-
-from src.common.logger import get_logger
-from src.plugin_system.apis import llm_api
+import asyncio
+import logging
 
 from ..core.exceptions import (
     LLMError,
@@ -30,8 +28,8 @@ from ..core.exceptions import (
     ScheduleGenerationError,
 )
 from ..core.models import Schedule, ScheduleItem, ScheduleType
+from ..utils.llm_logger import log_llm_call
 from ..utils.timezone_manager import TimezoneManager
-from .goal_manager import GoalManager
 from .generator import (
     BaseScheduleGenerator,
     LLMResponseParser,
@@ -39,8 +37,10 @@ from .generator import (
     ScheduleQualityScorer,
     ScheduleSemanticValidator,
 )
+from .generator.continuity_state import find_continuity_violations
+from .goal_manager import GoalManager
 
-logger = get_logger("autonomous_planning.schedule_generator")
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -63,14 +63,21 @@ class ScheduleGenerator:
     - ScheduleGeneratorConfig: 配置管理
     """
 
-    def __init__(self, goal_manager: GoalManager, config: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        goal_manager: GoalManager,
+        config: Optional[Dict[str, Any]] = None,
+        plugin: Optional[Any] = None,
+    ):
         """初始化日程生成器
 
         Args:
             goal_manager: 目标管理器
             config: 配置字典
+            plugin: 插件实例引用（用于通过 ctx.llm 调用 LLM；v4 必需）
         """
         self.goal_manager = goal_manager
+        self._plugin = plugin  # v4 新增：用于访问 ctx.llm.generate
 
         # 🆕 使用配置管理器（DRY原则）
         self.config = ScheduleGeneratorConfig(config)
@@ -173,9 +180,48 @@ class ScheduleGenerator:
 
         preferences = preferences or {}
 
-        # 加载昨日日程作为上下文
+        # 加载最近 N 天日程作为上下文（防止交替式重复）
+        recent_days = int(self.config._raw_config.get("recent_schedule_days", 3))
         self.base_generator.yesterday_schedule_summary = \
-            self.base_generator.load_yesterday_schedule_summary()
+            self.base_generator.context_loader.load_recent_schedule_summary(days=recent_days)
+
+        # 加载今日 pending_commitments 作为上下文
+        today_str = self.tz_manager.get_now().strftime("%Y-%m-%d")
+        pending = self.goal_manager.get_pending_commitments(today_str)
+        self.base_generator.pending_commitments = [
+            {
+                "time": (p.parameters or {}).get("time", ""),
+                "title": p.name,
+                "notes": (p.parameters or {}).get("notes", ""),
+            }
+            for p in pending
+        ] or None
+        if pending:
+            logger.info(f"📌 今日有 {len(pending)} 条未来约定将被纳入日程生成")
+
+        # 加载跨群历史 + 知识库（D 阶段；失败静默不阻塞生成）
+        raw_cfg = self.config._raw_config if hasattr(self.config, "_raw_config") else {}
+        allowed = raw_cfg.get("allowed_streams", []) or []
+        history_limit = int(raw_cfg.get("history_message_limit", 0) or 0)
+        knowledge_limit = int(raw_cfg.get("knowledge_search_limit", 0) or 0)
+        try:
+            self.base_generator.history_context = (
+                await self.base_generator.context_loader.load_recent_history_across_streams(
+                    self._plugin, allowed, history_limit,
+                )
+            )
+        except Exception as exc:
+            logger.debug(f"跨群历史加载失败: {exc}")
+            self.base_generator.history_context = ""
+        try:
+            self.base_generator.knowledge_context = (
+                await self.base_generator.context_loader.load_relevant_knowledge(
+                    self._plugin, query_hint=today_str, limit=knowledge_limit,
+                )
+            )
+        except Exception as exc:
+            logger.debug(f"知识库检索失败: {exc}")
+            self.base_generator.knowledge_context = ""
 
         # 生成日程项
         if use_multi_round:
@@ -198,7 +244,7 @@ class ScheduleGenerator:
             schedule_type=ScheduleType.DAILY,
             name=f"每日计划 - {self.tz_manager.get_now().strftime('%Y-%m-%d')}",
             items=schedule_items,
-            metadata={"preferences": preferences}
+            metadata={"preferences": preferences, "schedule_date": today_str}
         )
 
         logger.info(f"✅ 每日计划生成完成: {len(schedule_items)}个活动")
@@ -340,10 +386,38 @@ class ScheduleGenerator:
 
         goals_data = []
 
-        for item in schedule.items:
+        # v4.4.5：先把"今日 pending_commitments"映射到 schedule.items 上
+        # —— LLM 生成日程时不一定显式标记哪个 item 来自约定，这里用"最接近的时间窗口"
+        # 找出每条约定对应的 item，给那个 item 注入 ``is_commitment`` / ``commitment_*``
+        # 元数据，落库后 ProactiveService 才能识别出"这是约定，要用强指令叫 LLM 发送"。
+        commitment_metadata_by_item_idx: Dict[int, Dict[str, Any]] = {}
+        if schedule.schedule_type == ScheduleType.DAILY:
+            try:
+                today_str = self.tz_manager.get_now().strftime("%Y-%m-%d")
+                commitment_metadata_by_item_idx = self._match_commitments_to_items(
+                    schedule.items, today_str,
+                )
+            except Exception as exc:
+                logger.warning(f"约定→日程项 匹配失败（不影响落库）: {exc}", exc_info=True)
+
+        for idx, item in enumerate(schedule.items):
             try:
                 # 设置时间窗口
                 parameters = item.parameters.copy() if item.parameters else {}
+
+                # v4.4.6：显式记录日程所属日期。旧逻辑只按 created_at 判断日期，
+                # 一旦调度/测试在目标日前后创建记录，跨日上下文就会读错。
+                schedule_date = ""
+                if schedule.metadata:
+                    schedule_date = str(schedule.metadata.get("schedule_date") or "").strip()
+                if not schedule_date:
+                    schedule_date = self.tz_manager.get_now().strftime("%Y-%m-%d")
+                parameters["schedule_date"] = schedule_date
+
+                # v4.4.5：把匹配到的 commitment 元数据注入 parameters
+                commitment_meta = commitment_metadata_by_item_idx.get(idx)
+                if commitment_meta:
+                    parameters.update(commitment_meta)
 
                 # 从time_slot解析时间窗口
                 if item.time_slot:
@@ -359,8 +433,9 @@ class ScheduleGenerator:
                     else:
                         end_minutes = start_minutes + 60  # 默认1小时
 
-                    # 避免跨午夜
-                    if end_minutes > 24 * 60:
+                    # 跨天活动支持：开关开启时保留 end_minutes > 1440（数据层的跨夜分支会处理）
+                    cross_day_enabled = bool(self.config._raw_config.get("cross_day_activity", True))
+                    if not cross_day_enabled and end_minutes > 24 * 60:
                         end_minutes = 24 * 60
 
                     parameters["time_window"] = [start_minutes, end_minutes]
@@ -388,10 +463,123 @@ class ScheduleGenerator:
             created_goals = self.goal_manager.create_goals_batch(goals_data)
             created_goal_ids = [g.goal_id for g in created_goals]
             logger.info(f"✅ 批量创建了 {len(created_goal_ids)} 个目标")
+
+            # 消费今日 pending_commitments（成功 apply 后才标记）
+            if schedule.schedule_type == ScheduleType.DAILY:
+                today_str = self.tz_manager.get_now().strftime("%Y-%m-%d")
+                try:
+                    consumed = self.goal_manager.consume_pending_commitments(today_str)
+                    if consumed:
+                        logger.info(f"📌 已消费 {len(consumed)} 条未来约定")
+                except Exception as exc:
+                    logger.warning(f"消费未来约定失败: {exc}", exc_info=True)
+
             return created_goal_ids
         else:
             logger.warning("没有有效的日程项可以应用")
             return []
+
+    def _match_commitments_to_items(
+        self,
+        items: List[ScheduleItem],
+        today_str: str,
+    ) -> Dict[int, Dict[str, Any]]:
+        """把今日 pending_commitments 一对一匹配到 schedule items。
+
+        LLM 生成日程 JSON 时**不会显式标记**哪个 item 来自约定（prompt 里只是
+        要求"把上述约定安排到合适时间段"），落库后无法直接区分。本方法在
+        :meth:`apply_schedule` 落库前，按以下规则把约定与 item 建立映射：
+
+        1. 优先按时间匹配：约定 ``time="HH:MM"`` 与 item ``time_slot`` 差 ≤ 30 分钟
+        2. 若约定无时间，按标题子串匹配（约定 title 出现在 item.name/description 中）
+        3. 一对一约束：每个约定只匹配一个 item，每个 item 最多接收一个约定
+           （首次匹配优先；同时段多个约定时按 commitment 加入顺序）
+
+        Args:
+            items: LLM 生成的当日日程项列表（未落库）
+            today_str: ``YYYY-MM-DD``，用于查询当日 pending_commitments
+
+        Returns:
+            ``{item_index: {"is_commitment": True, "commitment_title": ..., ...}}``
+            映射，调用方把对应 dict ``update`` 到 item 的 parameters 中即可。
+        """
+        pending = self.goal_manager.get_pending_commitments(today_str)
+        if not pending:
+            return {}
+
+        # 解析 item.time_slot 为分钟数（与 parse_time_window 一致的格式）
+        def _item_start_minutes(it: ScheduleItem) -> Optional[int]:
+            if not it.time_slot:
+                return None
+            try:
+                parts = it.time_slot.split(":")
+                return int(parts[0]) * 60 + (int(parts[1]) if len(parts) > 1 else 0)
+            except (ValueError, IndexError):
+                return None
+
+        result: Dict[int, Dict[str, Any]] = {}
+        used_item_idx: set[int] = set()
+
+        for commit in pending:
+            params = commit.parameters or {}
+            commit_time = str(params.get("time") or "").strip()
+            commit_title = commit.name.strip()
+            commit_notes = str(params.get("notes") or "").strip()
+            commit_reason = str(params.get("reason") or "").strip()
+
+            best_idx: Optional[int] = None
+
+            # 规则 1：按时间匹配（≤ 30 分钟）
+            if commit_time and ":" in commit_time:
+                try:
+                    th, tm = commit_time.split(":", 1)
+                    commit_minutes = int(th) * 60 + int(tm)
+                except ValueError:
+                    commit_minutes = None
+                if commit_minutes is not None:
+                    best_diff = 31
+                    for idx, it in enumerate(items):
+                        if idx in used_item_idx:
+                            continue
+                        item_minutes = _item_start_minutes(it)
+                        if item_minutes is None:
+                            continue
+                        diff = abs(item_minutes - commit_minutes)
+                        if diff < best_diff:
+                            best_diff = diff
+                            best_idx = idx
+
+            # 规则 2：标题子串匹配（兜底；约定无 time 或时间匹配未命中时）
+            if best_idx is None and commit_title:
+                for idx, it in enumerate(items):
+                    if idx in used_item_idx:
+                        continue
+                    haystack = f"{it.name or ''}{it.description or ''}"
+                    if commit_title in haystack:
+                        best_idx = idx
+                        break
+
+            if best_idx is None:
+                logger.warning(
+                    "约定 %r 未在日程项中找到对应活动（time=%s）",
+                    commit_title, commit_time or "未指定",
+                )
+                continue
+
+            result[best_idx] = {
+                "is_commitment": True,
+                "commitment_title": commit_title,
+                "commitment_notes": commit_notes,
+                "commitment_reason": commit_reason,
+                "commitment_time": commit_time,
+            }
+            used_item_idx.add(best_idx)
+            logger.info(
+                "🔗 约定 %r → 日程项[%d] %r（time_slot=%s）",
+                commit_title, best_idx, items[best_idx].name, items[best_idx].time_slot,
+            )
+
+        return result
 
     def get_schedule_summary(self, schedule: Schedule) -> str:
         """获取日程摘要（简洁版 - 显示时间范围）"""
@@ -419,6 +607,63 @@ class ScheduleGenerator:
 
         return "\n".join(lines)
 
+    async def regenerate_today_schedule(
+        self,
+        user_id: str,
+        chat_id: str,
+        *,
+        extra_prompt: str = "",
+        auto_apply: bool = True,
+    ) -> Schedule:
+        """重生成今日日程：先删除今天已有 schedule_goals，再走标准生成 + apply。
+
+        Args:
+            user_id: 用户 ID。
+            chat_id: 聊天 ID（保持与 generate_daily_schedule 一致）。
+            extra_prompt: 临时追加到 custom_prompt 的描述（如角色裁判通过的请求）。
+            auto_apply: 是否自动 apply 到 goals 表；False 时仅返回 Schedule。
+
+        Returns:
+            新生成的 Schedule 对象。
+        """
+        today_str = self.tz_manager.get_now().strftime("%Y-%m-%d")
+
+        # 临时叠加 extra_prompt 到 custom_prompt
+        original_custom = self.config._raw_config.get("custom_prompt", "")
+        if extra_prompt:
+            merged = (original_custom + "\n\n" + extra_prompt).strip() if original_custom else extra_prompt
+            self.config._raw_config["custom_prompt"] = merged
+            self.base_generator.config["custom_prompt"] = merged
+            self.base_generator.prompt_builder.config["custom_prompt"] = merged
+
+        try:
+            # 先生成新日程，成功后才删旧的——防止生成失败导致今天变空。
+            schedule = await self.generate_daily_schedule(
+                user_id=user_id,
+                chat_id=chat_id,
+                use_llm=True,
+                force_regenerate=True,
+            )
+
+            if auto_apply:
+                # 删旧 → 落新，保证原子感（删旧失败不影响落新）
+                existing = self.goal_manager.get_schedule_goals(chat_id=chat_id, date_str=today_str)
+                for goal in existing:
+                    try:
+                        self.goal_manager.delete_goal(goal.goal_id)
+                    except Exception as exc:
+                        logger.warning(f"删除旧日程失败: {goal.goal_id} - {exc}")
+                if existing:
+                    logger.info(f"🧹 已清理 {len(existing)} 个今日旧日程，应用新日程")
+
+                await self.apply_schedule(schedule=schedule, user_id=user_id, chat_id=chat_id)
+            return schedule
+        finally:
+            # 还原 custom_prompt
+            self.config._raw_config["custom_prompt"] = original_custom
+            self.base_generator.config["custom_prompt"] = original_custom
+            self.base_generator.prompt_builder.config["custom_prompt"] = original_custom
+
     # ========================================================================
     # 内部方法（生成逻辑）
     # ========================================================================
@@ -437,6 +682,7 @@ class ScheduleGenerator:
         best_schedule = None
         best_score = 0
         validation_warnings = []
+        best_blocking_warnings: List[str] = []
 
         for round_num in range(1, max_rounds + 1):
             logger.debug(f"🔄 第{round_num}轮生成...")
@@ -460,22 +706,40 @@ class ScheduleGenerator:
 
                 # 验证和评分
                 validated_items, warnings = self.validator.validate(raw_items)
+                warnings.extend(self._validate_continuity_against_context(validated_items))
                 score = self.quality_scorer.calculate_score(validated_items, warnings)
+                blocking_warnings = self._extract_blocking_warnings(warnings)
 
                 logger.debug(f"📊 第{round_num}轮质量分数: {score:.2f}")
 
                 # 更新最佳结果
-                if score > best_score:
+                should_replace_best = (
+                    best_schedule is None
+                    or (best_blocking_warnings and not blocking_warnings)
+                    or (bool(best_blocking_warnings) == bool(blocking_warnings) and score > best_score)
+                )
+                if should_replace_best:
                     best_schedule = validated_items
                     best_score = score
                     validation_warnings = warnings
+                    best_blocking_warnings = blocking_warnings
 
                 # 如果分数足够高，提前结束
-                if score >= quality_threshold:
+                if score >= quality_threshold and not blocking_warnings:
                     logger.debug(f"✅ 质量达标，结束生成")
                     break
 
+            except (LLMQuotaExceededError, LLMRateLimitError) as e:
+                # 致命 LLM 错误（配额耗尽 / 速率限制）不应通过多轮重试解决，
+                # 立即向上抛出，让调用方感知并停止后续浪费配额的尝试。
+                logger.error(f"第{round_num}轮遇到致命 LLM 错误，停止多轮生成: {e}")
+                raise
+            except LLMTimeoutError as e:
+                # 超时是网络抖动型错误，可重试
+                logger.warning(f"第{round_num}轮 LLM 超时，将重试: {e}")
+                continue
             except Exception as e:
+                # 业务可重试错误（响应解析失败 / Schema 校验失败等）
                 logger.warning(f"第{round_num}轮生成失败: {e}")
                 continue
 
@@ -483,6 +747,13 @@ class ScheduleGenerator:
             raise ScheduleGenerationError(
                 f"多轮生成全部失败（尝试了{max_rounds}轮）",
                 attempt_count=max_rounds
+            )
+
+        if best_blocking_warnings:
+            raise ScheduleGenerationError(
+                "多轮生成未通过连续性硬约束，拒绝应用会丢失近期主线的日程："
+                + "；".join(best_blocking_warnings[:3]),
+                attempt_count=max_rounds,
             )
 
         # 转换为ScheduleItem对象
@@ -512,11 +783,20 @@ class ScheduleGenerator:
 
         # 验证
         validated_items, warnings = self.validator.validate(raw_items)
+        warnings.extend(self._validate_continuity_against_context(validated_items))
+        blocking_warnings = self._extract_blocking_warnings(warnings)
 
         if warnings:
             logger.warning(f"语义验证发现 {len(warnings)} 个问题")
             for warning in warnings[:3]:
                 logger.warning(f"  ⚠️ {warning}")
+
+        if blocking_warnings:
+            raise ScheduleGenerationError(
+                "日程生成未通过连续性硬约束，拒绝应用会丢失近期主线的日程："
+                + "；".join(blocking_warnings[:3]),
+                attempt_count=1,
+            )
 
         # 转换为ScheduleItem对象
         schedule_items = self._dict_to_schedule_items(validated_items)
@@ -524,8 +804,23 @@ class ScheduleGenerator:
         logger.info(f"✅ 生成 {len(schedule_items)} 个日程项")
         return schedule_items
 
+    def _validate_continuity_against_context(self, items: List[Dict[str, Any]]) -> List[str]:
+        """Validate generated items against recent schedule continuity state."""
+        raw_cfg = self.config._raw_config if hasattr(self.config, "_raw_config") else {}
+        if not bool(raw_cfg.get("continuity_validation_enabled", True)):
+            return []
+        recent_summary = self.base_generator.yesterday_schedule_summary or ""
+        if not recent_summary:
+            return []
+        return find_continuity_violations(items, recent_summary)
+
+    @staticmethod
+    def _extract_blocking_warnings(warnings: List[str]) -> List[str]:
+        """Continuity warnings are hard constraints, not cosmetic quality issues."""
+        return [warning for warning in warnings if "连续性硬约束" in warning]
+
     async def _call_llm(self, prompt: str) -> List[Dict[str, Any]]:
-        """调用LLM并解析响应
+        """调用 LLM 并解析响应（v4：通过 ctx.llm.generate）
 
         Args:
             prompt: 提示词
@@ -534,19 +829,48 @@ class ScheduleGenerator:
             日程项列表
 
         Raises:
-            LLMError: LLM调用失败
+            LLMError: LLM 调用失败
         """
-        # 获取模型配置
-        model_config, max_tokens, temperature = self.base_generator.get_model_config()
+        # 获取任务名 + 参数（v4：task_name 字符串，不再是 model_config 对象）
+        task_name, max_tokens, temperature = self.base_generator.get_model_config()
 
-        # 调用LLM
-        success, response, reasoning, model_name = await llm_api.generate_with_model(
-            prompt,
-            model_config=model_config,
-            request_type="plugin.autonomous_planning.schedule_gen",
+        # v4：必须通过插件 ctx.llm 调用，未注入 plugin 视为编程错误
+        if self._plugin is None:
+            raise LLMError("ScheduleGenerator 未注入 plugin 实例，无法调用 ctx.llm.generate")
+
+        # 把配置的 generation_timeout（秒）转为 RPC timeout_ms，突破默认 30s 限制。
+        gen_timeout_sec = float(getattr(self.config, 'generation_timeout', 180.0) or 180.0)
+        rpc_timeout_ms = max(60_000, int(gen_timeout_sec * 1000))
+
+        # SDK 2.8+：任务名必须通过 task_name 传递，model 仅表示具体模型名。
+        llm_result = await self._plugin.ctx.llm.generate(
+            prompt=prompt,
+            task_name=task_name,
             max_tokens=max_tokens,
-            temperature=temperature
+            temperature=temperature,
+            timeout_ms=rpc_timeout_ms,
         )
+        success = bool(llm_result.get("success", False))
+        response = str(llm_result.get("response", ""))
+
+        # Doubao Responses API 在某些配置下将内容放在嵌套路径
+        # raw_data.output[0].content[0].text 中，而顶层的 response/content
+        # 为空。这里尝试从 raw_data 中提取。
+        if not response and isinstance(llm_result.get("raw_data"), dict):
+            raw = llm_result["raw_data"]
+            for output_block in raw.get("output") or []:
+                if isinstance(output_block, dict):
+                    for content_block in output_block.get("content") or []:
+                        if isinstance(content_block, dict):
+                            text = str(content_block.get("text") or "").strip()
+                            if text:
+                                response = text
+                                break
+                    if response:
+                        break
+
+        # 归档 LLM 调用（受配置开关控制；失败静默）
+        self._archive_llm_call("schedule_generation", prompt, response, task_name, success)
 
         if not success:
             # 智能识别错误类型
@@ -559,7 +883,7 @@ class ScheduleGenerator:
                 raise LLMRateLimitError(f"LLM速率限制: {response}", retry_after_seconds=10)
 
             if any(kw in error_msg for kw in ["timeout", "timed out", "超时"]):
-                raise LLMTimeoutError(f"LLM调用超时: {response}", timeout_seconds=30)
+                raise LLMTimeoutError(f"LLM调用超时: {response}", timeout_seconds=int(gen_timeout_sec))
 
             raise LLMError(f"LLM调用失败: {response}")
 
@@ -567,6 +891,30 @@ class ScheduleGenerator:
         items = self.response_parser.parse_schedule_response(response)
 
         return items
+
+    def _archive_llm_call(
+        self,
+        call_type: str,
+        prompt: str,
+        response: str,
+        model: str,
+        success: bool,
+    ) -> None:
+        """把一次 LLM 调用归档到 ``data/llm_logs/``。
+
+        受配置 ``llm_log_enabled`` 控制；失败时不影响主流程。
+        """
+        raw = self.config._raw_config if hasattr(self.config, "_raw_config") else {}
+        if not raw.get("llm_log_enabled", True):
+            return
+        log_dir = raw.get("llm_log_dir")
+        if not log_dir:
+            # plugin 未注入路径时跳过（测试场景）
+            if self._plugin is None or not hasattr(self._plugin, "_plugin_root"):
+                return
+            log_dir = self._plugin._plugin_root / "data" / "llm_logs"
+        from pathlib import Path
+        log_llm_call(call_type, prompt, response, model, success, Path(log_dir))
 
     def _dict_to_schedule_items(self, items_dict: List[Dict]) -> List[ScheduleItem]:
         """将字典列表转换为ScheduleItem对象列表"""

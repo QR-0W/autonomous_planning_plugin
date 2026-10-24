@@ -4,14 +4,15 @@
 通过关键词匹配和权重评分，准确识别用户是否在询问当前状态、未来计划等。
 """
 
-import re
 from enum import Enum
 from typing import Tuple, Optional
+import logging
+import re
+
 from dataclasses import dataclass
 
-from src.common.logger import get_logger
 
-logger = get_logger("autonomous_planning.intent_classifier")
+logger = logging.getLogger(__name__)
 
 
 @dataclass

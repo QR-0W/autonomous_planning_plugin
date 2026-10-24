@@ -29,18 +29,59 @@ Example:
     ... )
 """
 
-import uuid
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
-from src.common.logger import get_logger
+import logging
+import uuid
 
 from ..database import GoalDatabase
+from ..utils.time_utils import strip_tz
 from ..utils.timezone_manager import TimezoneManager
 
-logger = get_logger("autonomous_planning.goal_manager")
+logger = logging.getLogger(__name__)
+
+
+# 支持的日期格式（按优先级尝试）：
+#   "2026-05-26" / "2026/05/26" / "20260526" / "2026-05-26T10:30:00" / "2026-05-26 10:30:00"
+_COMMITMENT_DATE_FORMATS = ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S")
+
+
+def _normalize_commitment_date(raw: str, today: datetime) -> str:
+    """把任意输入归一化为 ``YYYY-MM-DD``。
+
+    解析失败时记 warning 并回退为 ``today``，保证调用方拿到的总是合法日期字符串
+    （而不是写库存歧义格式，导致 get/consume 漏匹配）。
+
+    Args:
+        raw: 调用方传入的日期字符串（可能是 ISO / 含时间 / 斜杠分隔等）。
+        today: 解析失败时的兜底日期（仅取日期部分）。
+
+    Returns:
+        ``YYYY-MM-DD`` 格式的字符串。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return today.strftime("%Y-%m-%d")
+    # 已经是规范格式，直接返回
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        pass
+    # ISO 8601 含 tz 后缀（``2026-05-26T10:30:00+08:00``）
+    try:
+        return datetime.fromisoformat(text).strftime("%Y-%m-%d")
+    except ValueError:
+        pass
+    # 其它备选格式
+    for fmt in _COMMITMENT_DATE_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    logger.warning(f"commitment_date 无法解析: {raw!r}，回退为今天 {today.strftime('%Y-%m-%d')}")
+    return today.strftime("%Y-%m-%d")
 
 
 class GoalStatus(Enum):
@@ -213,7 +254,7 @@ class Goal:
 
         # Check deadline
         tz_manager = TimezoneManager()
-        if self.deadline and tz_manager.get_now() > self.deadline:
+        if self.deadline and strip_tz(tz_manager.get_now()) > strip_tz(self.deadline):
             return False
 
         return True
@@ -255,7 +296,7 @@ class Goal:
 
         if self.deadline:
             tz_manager = TimezoneManager()
-            time_left = self.deadline - tz_manager.get_now()
+            time_left = strip_tz(self.deadline) - strip_tz(tz_manager.get_now())
             if time_left.total_seconds() > 0:
                 days = time_left.days
                 hours = time_left.seconds // 3600
@@ -447,16 +488,118 @@ class GoalManager:
         active_goals = self.get_active_goals()
         return [g for g in active_goals if g.should_execute_now()]
 
+    # ============================================================
+    # pending_commitments：未来约定（goal_type="pending_commitment"）
+    # ============================================================
+    #
+    # 复用 goals 表存储，用 goal_type 区分；parameters JSON 中含：
+    #   commitment_date: "YYYY-MM-DD"
+    #   time: "HH:MM" 或 ""
+    #   notes: 描述备注
+    #   reason: 角色裁判给出的接受理由
+    #   source: "user_request" / "auto" 等
+    # 消费时 status 改为 COMPLETED，不删除（保留审计）。
+
+    def add_pending_commitment(
+        self,
+        commitment_date: str,
+        title: str,
+        *,
+        time: str = "",
+        notes: str = "",
+        reason: str = "",
+        creator_id: str = "system",
+    ) -> Goal:
+        """添加一条未来约定。
+
+        Args:
+            commitment_date: 约定日期，``YYYY-MM-DD`` 格式。
+            title: 约定标题（对应 Goal.name）。
+            time: 可选的时间（HH:MM）。
+            notes: 可选的备注。
+            reason: 可选的角色裁判理由。
+            creator_id: 创建者 ID。
+
+        Returns:
+            新创建的 Goal 对象。
+        """
+        # 防御性规范化：调用方传入的格式可能不统一（"2026/05/26"、ISO datetime、
+        # 仅含时间分量等），与 get/consume 保持同一比较口径
+        normalized_date = _normalize_commitment_date(commitment_date, self.tz_manager.get_now())
+        parameters = {
+            "commitment_date": normalized_date,
+            "time": time,
+            "notes": notes,
+            "reason": reason,
+            "source": "user_request",
+        }
+        return self.create_goal(
+            name=title,
+            description=notes or title,
+            goal_type="pending_commitment",
+            creator_id=creator_id,
+            chat_id="global",
+            priority="medium",
+            parameters=parameters,
+        )
+
+    def get_pending_commitments(
+        self,
+        commitment_date: Optional[str] = None,
+    ) -> List[Goal]:
+        """查询未来约定。
+
+        Args:
+            commitment_date: 指定日期；留空 = 今天。
+
+        Returns:
+            匹配的 pending_commitment 列表（仅返回 status=active 的）。
+        """
+        if commitment_date is None:
+            commitment_date = self.tz_manager.get_now().strftime("%Y-%m-%d")
+        else:
+            # 输入也走规范化，避免和写入时格式不一致漏匹配
+            commitment_date = _normalize_commitment_date(commitment_date, self.tz_manager.get_now())
+
+        candidates = self.get_all_goals(chat_id="global", status=GoalStatus.ACTIVE)
+        return [
+            g for g in candidates
+            if g.goal_type == "pending_commitment"
+            and (g.parameters or {}).get("commitment_date") == commitment_date
+        ]
+
+    def consume_pending_commitments(
+        self,
+        commitment_date: str,
+    ) -> List[Goal]:
+        """消费指定日期的全部未消费约定（标记为 COMPLETED）。
+
+        Args:
+            commitment_date: 目标日期。
+
+        Returns:
+            被消费的约定列表。
+        """
+        consumed = self.get_pending_commitments(commitment_date)
+        for goal in consumed:
+            self.db.update_goal(goal.goal_id, status=GoalStatus.COMPLETED.value)
+        if consumed:
+            logger.info(f"已消费 {len(consumed)} 条 {commitment_date} 的未来约定")
+        return consumed
+
     def get_schedule_goals(
         self,
         chat_id: str = "global",
-        date_str: Optional[str] = None
+        date_str: Optional[str] = None,
+        include_yesterday: bool = False,
     ) -> List[Goal]:
         """Get schedule goals (goals with time_window).
 
         Args:
             chat_id: Chat identifier (default: "global")
             date_str: Date string (YYYY-MM-DD, default: today)
+            include_yesterday: 同时返回昨日创建的 schedule goals（供 inject_service
+                识别跨夜活动）。
 
         Returns:
             List of schedule Goal objects
@@ -464,10 +607,21 @@ class GoalManager:
         if date_str is None:
             date_str = self.tz_manager.get_now().strftime("%Y-%m-%d")
 
+        target_dates = {date_str}
+        if include_yesterday:
+            try:
+                base = datetime.strptime(date_str, "%Y-%m-%d")
+                target_dates.add((base - timedelta(days=1)).strftime("%Y-%m-%d"))
+            except (TypeError, ValueError):
+                pass
+
         goals = self.get_all_goals(chat_id=chat_id)
         schedule_goals = []
 
         for goal in goals:
+            # 跳过 pending_commitment 类型，避免污染日程列表
+            if goal.goal_type == "pending_commitment":
+                continue
             # Check for time_window in parameters or conditions
             has_time_window = False
             if goal.parameters and "time_window" in goal.parameters:
@@ -476,16 +630,12 @@ class GoalManager:
                 has_time_window = True
 
             if has_time_window:
-                # Check creation date
-                goal_date = None
-                if goal.created_at:
-                    try:
-                        goal_date = goal.created_at.strftime("%Y-%m-%d")
-                    except Exception:
-                        pass
+                # Prefer explicit schedule_date written by ScheduleGenerator.
+                # Legacy rows do not have it, so created_at remains the fallback.
+                goal_date = self._get_goal_schedule_date(goal)
 
-                # Only return goals for specified date
-                if goal_date == date_str:
+                # Only return goals for specified dates
+                if goal_date in target_dates:
                     schedule_goals.append(goal)
 
         # 去重：按 (name, time_window) 去重，防止重复日程显示
@@ -517,6 +667,29 @@ class GoalManager:
             return unique_goals
 
         return schedule_goals
+
+    @staticmethod
+    def _get_goal_schedule_date(goal: Goal) -> Optional[str]:
+        """Return the logical schedule date for a goal.
+
+        Older versions inferred the date solely from ``created_at``.  That is
+        fragile around midnight and for tests/maintenance scripts, so new
+        schedule rows store ``parameters.schedule_date`` explicitly while this
+        helper keeps old rows readable.
+        """
+        for container in (goal.parameters, goal.conditions):
+            if isinstance(container, dict):
+                raw_date = str(container.get("schedule_date") or "").strip()
+                if raw_date:
+                    return raw_date[:10]
+        if goal.created_at:
+            try:
+                if isinstance(goal.created_at, str):
+                    return goal.created_at.split("T")[0] if "T" in goal.created_at else goal.created_at[:10]
+                return goal.created_at.strftime("%Y-%m-%d")
+            except Exception:
+                return None
+        return None
 
     def update_goal(self, goal_id: str, **kwargs) -> bool:
         """Update goal fields.
@@ -673,14 +846,13 @@ class GoalManager:
             if not has_time_window:
                 continue  # 跳过非日程类型的目标
 
-            # 检查创建日期
-            if goal.created_at:
-                goal_date = goal.created_at.strftime("%Y-%m-%d")
-                if goal_date < today_str:
-                    # 这是昨天或更早的日程，标记为完成
-                    self.update_goal_status(goal.goal_id, GoalStatus.COMPLETED)
-                    expired_count += 1
-                    logger.debug(f"Marked expired schedule as completed: {goal.name} (created: {goal_date})")
+            # 检查逻辑日程日期（新行优先 schedule_date，旧行回退 created_at）
+            goal_date = self._get_goal_schedule_date(goal)
+            if goal_date and goal_date < today_str:
+                # 这是昨天或更早的日程，标记为完成
+                self.update_goal_status(goal.goal_id, GoalStatus.COMPLETED)
+                expired_count += 1
+                logger.debug(f"Marked expired schedule as completed: {goal.name} (schedule_date: {goal_date})")
 
         if expired_count > 0:
             logger.info(f"🧹 清理了 {expired_count} 个过期日程（昨天及更早）")
@@ -773,3 +945,18 @@ def get_goal_manager() -> GoalManager:
     if _goal_manager is None:
         _goal_manager = GoalManager()
     return _goal_manager
+
+
+def close_goal_manager() -> None:
+    """关闭并释放全局 GoalManager 单例所持有的数据库连接。
+
+    供插件 ``on_unload`` 调用，避免长时间运行后线程本地连接累积。
+    再次调用 ``get_goal_manager()`` 会重建实例。
+    """
+    global _goal_manager
+    if _goal_manager is not None:
+        try:
+            _goal_manager.db.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"关闭目标数据库连接异常: {exc}")
+        _goal_manager = None

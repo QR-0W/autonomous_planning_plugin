@@ -16,7 +16,33 @@ Example:
     09:00 - 17:00
 """
 
+from datetime import datetime
 from typing import Any, List, Optional, Tuple, Union
+
+
+def strip_tz(dt: Optional[datetime]) -> Optional[datetime]:
+    """剥离 datetime 的 tzinfo，便于跨 tz-aware / tz-naive 安全比较。
+
+    历史背景：v4.0 时代 ``TimezoneManager`` 用 pytz 或系统时区，``get_now()``
+    返回的 datetime 可能是 tz-naive；v4.1 切到 ``zoneinfo`` 后变成 tz-aware。
+    数据库里旧数据是 tz-naive 字符串，新数据是 tz-aware 字符串，两者直接比较
+    会抛 ``TypeError: can't compare offset-naive and offset-aware datetimes``。
+
+    在所有 ``goal.created_at`` / ``goal.deadline`` 与"现在"的比较点统一剥离 tz，
+    保证不会爆错。代价：失去时区精度（但本插件比较都是天级别，影响可忽略）。
+
+    Args:
+        dt: 可能带也可能不带 tzinfo 的 datetime；``None`` 直接返回。
+
+    Returns:
+        相同时刻的 tz-naive datetime；``None`` 输入返回 ``None``。
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        return dt.replace(tzinfo=None)
+    return dt
+
 
 
 def migrate_time_window(time_window: Optional[List[Union[int, float]]]) -> Optional[List[int]]:

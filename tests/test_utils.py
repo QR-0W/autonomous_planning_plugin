@@ -3,9 +3,10 @@
 测试 utils/time_utils.py 和 tools.py 中的辅助函数
 """
 
-import unittest
-import sys
 from pathlib import Path
+import sys
+
+import unittest
 
 # 添加父目录到路径
 plugin_dir = Path(__file__).parent.parent

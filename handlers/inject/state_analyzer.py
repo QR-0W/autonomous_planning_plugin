@@ -4,13 +4,13 @@
 根据活动类型和进度，动态生成自然的状态文本。
 """
 
-import random
 from enum import Enum
 from typing import Optional, Tuple
+import logging
+import random
 
-from src.common.logger import get_logger
 
-logger = get_logger("autonomous_planning.state_analyzer")
+logger = logging.getLogger(__name__)
 
 
 class ActivityState(Enum):

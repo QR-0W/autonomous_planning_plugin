@@ -4,14 +4,15 @@
 用于智能注入决策，判断是否需要在连续对话中继续注入日程信息。
 """
 
-import time
 from collections import deque
-from dataclasses import dataclass
 from typing import Dict, Optional, Deque
+import logging
+import time
 
-from src.common.logger import get_logger
+from dataclasses import dataclass
 
-logger = get_logger("autonomous_planning.context_cache")
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass

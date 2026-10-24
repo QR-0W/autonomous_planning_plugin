@@ -5,10 +5,10 @@ Separated from BaseScheduleGenerator to follow Single Responsibility Principle.
 """
 
 from typing import Any, Dict
+import logging
 
-from src.common.logger import get_logger
 
-logger = get_logger("autonomous_planning.schema_builder")
+logger = logging.getLogger(__name__)
 
 
 class SchemaBuilder:

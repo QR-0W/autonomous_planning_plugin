@@ -33,22 +33,22 @@ Example:
     ... )
 """
 
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
 import base64
 import io
+import logging
 import math
 import os
 import random
 import threading
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, List, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
 
-from src.common.logger import get_logger
 from .timezone_manager import TimezoneManager
 
-logger = get_logger("autonomous_planning.schedule_image_generator")
+logger = logging.getLogger(__name__)
 
 
 class ScheduleImageGenerator:

@@ -13,12 +13,11 @@ Example:
 """
 
 from typing import Any, Dict, List
-
-from src.common.logger import get_logger
+import logging
 
 from ...utils.time_utils import time_slot_to_minutes
 
-logger = get_logger("autonomous_planning.quality_scorer")
+logger = logging.getLogger(__name__)
 
 
 class ScheduleQualityScorer:

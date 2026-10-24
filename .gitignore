@@ -4,38 +4,27 @@ __pycache__/
 *$py.class
 *.so
 .Python
-*.egg-info/
-dist/
-build/
 
-# 临时文档和分析报告
-docs/
-*_REPORT.md
-*_SUGGESTIONS.md
-
-# 插件数据目录
+# 运行时数据与日志
 data/
-*.db
-*.db-shm
-*.db-wal
-
-# Claude AI
-.claude/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
 *.log
 
-# Test coverage
-.coverage
-htmlcov/
-.spec-workflow/
+# cache/ 是 Python 源码目录（lru_cache.py / conversation_cache.py），
+# 只忽略其中的字节码，不要整目录忽略
+cache/__pycache__/
+
+# 本机专属：不进仓库
+config.toml
+config_back/
+changelogs/
+POC_RESULT.md
+
+# 环境与编辑器
+.env
+.venv/
+venv/
+.idea/
+.vscode/
+*.swp
+.DS_Store
+.claude/

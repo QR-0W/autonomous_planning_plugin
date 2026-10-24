@@ -14,10 +14,10 @@ Example:
 """
 
 from typing import Any, Dict, Optional
+import logging
 
-from src.common.logger import get_logger
 
-logger = get_logger("autonomous_planning.config")
+logger = logging.getLogger(__name__)
 
 
 class ScheduleGeneratorConfig:
@@ -78,12 +78,18 @@ class ScheduleGeneratorConfig:
         # === 自定义Prompt ===
         self.custom_prompt = config_dict.get('custom_prompt', '').strip()
 
+        # === 连续性校验 ===
+        self.continuity_validation_enabled = config_dict.get('continuity_validation_enabled', True)
+
         # === 缓存配置 ===
         self.cache_ttl = config_dict.get('cache_ttl', 300)
         self.cache_max_size = config_dict.get('cache_max_size', 100)
 
-        # === 自定义模型配置 ===
-        self.custom_model = config_dict.get('custom_model', {})
+        # === v4 新增：LLM 任务名 + bot 全局配置（由 plugin 注入） ===
+        self.llm_task_name = str(config_dict.get('llm_task_name', 'replyer')).strip() or 'replyer'
+        self.bot_profile = dict(config_dict.get('bot_profile', {}) or {})
+        # 时区（由 plugin 注入；旧版默认 Asia/Shanghai）
+        self.timezone = config_dict.get('timezone', 'Asia/Shanghai')
 
         # 保存原始配置字典（用于传递给子组件）
         self._raw_config = config_dict
@@ -192,9 +198,13 @@ class ScheduleGeneratorConfig:
             'max_tokens': self.max_tokens,
             'generation_timeout': self.generation_timeout,
             'custom_prompt': self.custom_prompt,
+            'continuity_validation_enabled': self.continuity_validation_enabled,
             'cache_ttl': self.cache_ttl,
             'cache_max_size': self.cache_max_size,
-            'custom_model': self.custom_model,
+            # v4 新增：LLM 任务名 + bot 全局配置 + 时区
+            'llm_task_name': self.llm_task_name,
+            'bot_profile': self.bot_profile,
+            'timezone': self.timezone,
         }
 
     def __repr__(self) -> str:

@@ -15,13 +15,13 @@
     ...     cache.mark_injected("chat_123")
 """
 
+from typing import Any, Dict, Optional
+import logging
 import threading
 import time
-from typing import Any, Dict, Optional
 
-from src.common.logger import get_logger
 
-logger = get_logger("autonomous_planning.cache.conversation")
+logger = logging.getLogger(__name__)
 
 
 class ConversationCache:

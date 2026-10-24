@@ -4,11 +4,11 @@
 遵循DRY原则,减少样板代码,提高可维护性。
 """
 
-import functools
 from typing import Any, Callable, Optional, Tuple
-from src.common.logger import get_logger
+import functools
+import logging
 
-logger = get_logger("autonomous_planning.exception_handler")
+logger = logging.getLogger(__name__)
 
 
 def handle_exception(
