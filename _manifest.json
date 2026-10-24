@@ -9,7 +9,7 @@
   },
   "license": "AGPL-3.0",
   "urls": {
-    "repository": "https://github.com/xuqian13/autonomous_planning_plugin"
+    "repository": "https://github.com/QR-0W/autonomous_planning_plugin"
   },
   "host_application": {
     "min_version": "1.0.0",
