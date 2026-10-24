@@ -162,7 +162,7 @@ class LLMResponseParser:
             解析后的字典对象
 
         Raises:
-            LLMInvalidResponseError: JSON解析失败时抛出
+            LLMInvalidResponseError: JSON解析失败或根节点不是对象时抛出
 
         Examples:
             >>> parser = LLMResponseParser()
@@ -178,7 +178,7 @@ class LLMResponseParser:
             cleaned = LLMResponseParser.clean_control_characters(cleaned)
 
             # 3. 解析JSON
-            return json.loads(cleaned)
+            data = json.loads(cleaned)
 
         except json.JSONDecodeError as e:
             # 记录详细错误信息以便调试
@@ -200,6 +200,13 @@ class LLMResponseParser:
                 response=response[:500]
             )
 
+        if not isinstance(data, dict):
+            error_msg = f"LLM响应根节点必须是对象（包含 'schedule_items' 字段），实际类型: {type(data).__name__}"
+            logger.error(error_msg)
+            raise LLMInvalidResponseError(error_msg, response=response[:500])
+
+        return data
+
     @staticmethod
     def extract_schedule_items(data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """从解析后的数据中提取schedule_items字段
@@ -211,7 +218,7 @@ class LLMResponseParser:
             schedule_items列表
 
         Raises:
-            LLMInvalidResponseError: 缺少schedule_items字段时抛出
+            LLMInvalidResponseError: 根节点、schedule_items或日程项类型无效，或缺少字段时抛出
 
         Examples:
             >>> parser = LLMResponseParser()
@@ -220,6 +227,11 @@ class LLMResponseParser:
             >>> len(items)
             1
         """
+        if not isinstance(data, dict):
+            error_msg = f"LLM响应根节点必须是对象（包含 'schedule_items' 字段），实际类型: {type(data).__name__}"
+            logger.error(error_msg)
+            raise LLMInvalidResponseError(error_msg, response=json.dumps(data, ensure_ascii=False)[:500])
+
         if "schedule_items" not in data:
             error_msg = "LLM响应缺少必需的 'schedule_items' 字段"
             logger.error(f"{error_msg}，实际字段: {list(data.keys())}")
@@ -237,6 +249,12 @@ class LLMResponseParser:
             logger.error(error_msg)
 
             raise LLMInvalidResponseError(error_msg)
+
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                error_msg = f"schedule_items[{index}]必须是对象，实际类型: {type(item).__name__}"
+                logger.error(error_msg)
+                raise LLMInvalidResponseError(error_msg)
 
         logger.debug(f"成功提取 {len(items)} 个日程项")
         return items

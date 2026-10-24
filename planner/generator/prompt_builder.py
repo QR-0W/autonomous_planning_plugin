@@ -311,6 +311,7 @@ daily_routine(作息)|meal(吃饭)|study(学习)|entertainment(娱乐)|social_ma
 
 【要求】
 - 严格JSON格式，无注释
+- 根节点必须是对象，包含 schedule_items 数组字段；禁止直接返回日程数组（[...]）。
 - time_slot按时间递增（HH:MM格式）
 - 🔴 核心要求：必须无缝覆盖全天，不能有任何时间空档！
   * 每个活动结束时间 = 下个活动开始时间
@@ -320,7 +321,7 @@ daily_routine(作息)|meal(吃饭)|study(学习)|entertainment(娱乐)|social_ma
 """ + ("- description填空字符串\"\"即可\n" if not enable_detailed_description else f"- description简洁，{min_desc_len}-{max_desc_len}字\n") + f"""- 体现{weekday}特色（{"周末睡懒觉" if is_weekend else "工作日早起"}）
 """
 
-        # 添加Schema约束（精简版）
+        # 添加完整根Schema约束
         if schema:
             import json
             schema_desc = f"""
@@ -330,7 +331,7 @@ daily_routine(作息)|meal(吃饭)|study(学习)|entertainment(娱乐)|social_ma
 """ + ("- description填空字符串\"\"即可\n" if not enable_detailed_description else f"- description: {min_desc_len}-{max_desc_len}字\n") + f"""- priority: high/medium/low
 - duration_hours: 0.25-12（活动持续时长，小时）
 
-Schema: {json.dumps(schema.get('properties', {}).get('schedule_items', {}), ensure_ascii=False)}
+Schema: {json.dumps(schema, ensure_ascii=False)}
 """
             prompt += schema_desc
 
